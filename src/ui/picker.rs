@@ -12,12 +12,28 @@ use crate::format;
 
 pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
     // Header: where we are, and what the scan would apply.
-    let filters = stat_line(vec![
+    let mut filter_parts = vec![
         toggle("hidden", !app.options.skip_hidden),
         toggle("gitignore", app.options.respect_gitignore),
         toggle("empty", !app.options.skip_empty),
         toggle("hardlinks", app.options.collapse_hardlinks),
-    ]);
+    ];
+    // An exclusion set silently shrinks the results, so say so.
+    if !app.options.exclude_exts.is_empty() {
+        filter_parts.push(vec![
+            Span::styled("excluding ", Style::default().fg(DIM)),
+            Span::styled(
+                app.options
+                    .exclude_exts
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Style::default().fg(DELETE).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let filters = stat_line(filter_parts);
 
     let path = format::truncate_path(
         &app.cwd.to_string_lossy(),

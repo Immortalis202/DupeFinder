@@ -56,9 +56,24 @@ dupefind ~/Pictures       # scan straight away
 | `--one-file-system` | Do not cross filesystem boundaries |
 | `--follow-links` | Follow symbolic links |
 | `--min-size BYTES` | Skip files below this size |
+| `--exclude-ext EXT` | Leave out files with this extension |
 
-Every filter is also toggleable in the browser with keys `1`–`4`; the header
-shows their current state.
+Every boolean filter is also toggleable in the browser with keys `1`–`4`; the
+header shows their current state.
+
+`--exclude-ext` repeats and accepts commas, so `--exclude-ext dll --exclude-ext exe`
+and `--exclude-ext dll,exe` are the same. Matching is case-insensitive and a
+leading dot is accepted, so `.DLL`, `DLL` and `dll` all work. Active exclusions
+are shown in the browser header, since they silently shrink the results:
+
+```sh
+dupefind --exclude-ext dll C:\Program Files
+```
+
+Shared libraries are the reason this exists. Two applications shipping the same
+DLL is deliberate, so those groups are not reclaimable space — excluding them
+outright beats skipping the same groups by hand on every scan. Use group
+selection instead if you would rather see them and decide case by case.
 
 ## Keys
 
@@ -258,7 +273,7 @@ a real folder cannot wipe it.
 cargo test
 ```
 
-151 tests covering the scanner against fixture trees with known answers
+161 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.

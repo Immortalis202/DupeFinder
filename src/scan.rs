@@ -175,7 +175,10 @@ fn walk(
         ScanState::bump(&state.files_seen, 1);
         ScanState::bump(&state.bytes_seen, size);
 
-        if (options.skip_empty && size == 0) || size < options.min_size {
+        if (options.skip_empty && size == 0)
+            || size < options.min_size
+            || options.excluded_by_extension(entry.path())
+        {
             ScanState::bump(&state.files_skipped, 1);
             continue;
         }
@@ -581,6 +584,96 @@ mod tests {
             groups.iter().any(|g| g.size == 0 && g.files.len() == 2),
             "the two empty files should form a zero-byte group"
         );
+    }
+
+    /// Duplicate shared libraries are usually deliberate, so they are noise.
+    #[test]
+    fn excluded_extensions_are_left_out_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lib = vec![0x4Du8; 5000];
+        fs::create_dir_all(root.join("appA")).unwrap();
+        fs::create_dir_all(root.join("appB")).unwrap();
+        fs::write(root.join("appA/shared.dll"), &lib).unwrap();
+        fs::write(root.join("appB/shared.dll"), &lib).unwrap();
+        // A real duplicate that must survive the filter.
+        let doc = b"a document duplicated on purpose";
+        fs::write(root.join("appA/notes.txt"), doc).unwrap();
+        fs::write(root.join("appB/notes.txt"), doc).unwrap();
+
+        // Without the filter, both pairs are reported.
+        let groups = scan_sync(root, ScanOptions::default());
+        assert_eq!(groups.len(), 2, "baseline: {:?}", group_names(&groups));
+
+        let options = ScanOptions {
+            exclude_exts: vec!["dll".to_string()],
+            ..Default::default()
+        };
+        let groups = scan_sync(root, options);
+        assert_eq!(
+            group_names(&groups),
+            [names(&["notes.txt", "notes.txt"])].into_iter().collect(),
+            "only the .dll pair should be gone"
+        );
+    }
+
+    #[test]
+    fn extension_matching_ignores_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lib = vec![0x4Du8; 5000];
+        fs::write(root.join("one.DLL"), &lib).unwrap();
+        fs::write(root.join("two.Dll"), &lib).unwrap();
+
+        let options = ScanOptions {
+            exclude_exts: vec!["dll".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            scan_sync(root, options).is_empty(),
+            "Windows treats FOO.DLL and foo.dll as the same file"
+        );
+    }
+
+    #[test]
+    fn an_excluded_extension_does_not_match_a_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let content = vec![0x7Fu8; 5000];
+        // "dl" must not match ".dll", and a file merely containing "dll" in its
+        // stem must not be excluded either.
+        fs::write(root.join("a.dl"), &content).unwrap();
+        fs::write(root.join("b.dl"), &content).unwrap();
+        fs::write(root.join("dll-notes.txt"), &content).unwrap();
+        fs::write(root.join("copy-dll-notes.txt"), &content).unwrap();
+
+        let options = ScanOptions {
+            exclude_exts: vec!["dll".to_string()],
+            ..Default::default()
+        };
+        let groups = scan_sync(root, options);
+        assert_eq!(
+            groups.len(),
+            1,
+            "all four files share content, so one group survives: {:?}",
+            group_names(&groups)
+        );
+        assert_eq!(groups[0].files.len(), 4);
+    }
+
+    #[test]
+    fn files_without_an_extension_are_never_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let content = vec![0x11u8; 5000];
+        fs::write(root.join("Makefile"), &content).unwrap();
+        fs::write(root.join("Makefile.bak"), &content).unwrap();
+
+        let options = ScanOptions {
+            exclude_exts: vec!["dll".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(scan_sync(root, options).len(), 1);
     }
 
     #[test]

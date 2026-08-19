@@ -231,6 +231,31 @@ pub struct ScanOptions {
     pub same_file_system: bool,
     pub follow_links: bool,
     pub min_size: u64,
+    /// Extensions to leave out entirely, lower-case and without the dot.
+    ///
+    /// Duplicate shared libraries are usually deliberate -- two applications
+    /// shipping the same DLL -- so removing them breaks things rather than
+    /// reclaiming space. Excluding them keeps the results actionable instead of
+    /// making you skip the same groups on every scan.
+    pub exclude_exts: Vec<String>,
+}
+
+impl ScanOptions {
+    /// Whether this path is excluded by extension. Case-insensitive, because
+    /// `FOO.DLL` and `foo.dll` are the same file to Windows.
+    pub fn excluded_by_extension(&self, path: &std::path::Path) -> bool {
+        if self.exclude_exts.is_empty() {
+            return false;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) => {
+                let ext = ext.to_lowercase();
+                self.exclude_exts.contains(&ext)
+            }
+            // No extension, or one that is not valid UTF-8: nothing to match.
+            None => false,
+        }
+    }
 }
 
 impl Default for ScanOptions {
@@ -243,6 +268,7 @@ impl Default for ScanOptions {
             same_file_system: false,
             follow_links: false,
             min_size: 0,
+            exclude_exts: Vec::new(),
         }
     }
 }
