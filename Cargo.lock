@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "dupefind"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
