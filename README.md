@@ -226,9 +226,11 @@ cargo run --release -- testdata            # scan it
 
 It prints the result the scan should produce (4 groups, 7 duplicates, 4.45 MiB)
 and lists what it deliberately leaves un-duplicated and why — equal-size files
-with different content, two files sharing their first 100 KiB but differing in
-the final byte, 0-byte files, a hidden copy, a gitignored copy, and a hardlink
-pair. Those exist to prove matching is by content, not by size, name or head.
+with different content, two 200 KB files identical except their final byte,
+0-byte files, a hidden copy, a gitignored copy, and a hardlink pair. Those exist
+to prove matching is by content, not by size, name or prefix: the head-hash phase
+reads only the first 16 KiB, so the same-head pair reaches the full-hash phase and
+must be rejected there.
 
 `apps/*/shared.dll` and `system/shared.dll` are four copies of one library, the
 case group selection is for: mark the group with `m` and `x` to protect it.

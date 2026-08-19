@@ -103,8 +103,10 @@ fn main() -> io::Result<()> {
     write_file(&root, "tricky/same-size-a.bin", &filler(20, 64_000))?;
     write_file(&root, "tricky/same-size-b.bin", &filler(21, 64_000))?;
 
-    // Same size and same first 100 KiB, differing only in the final byte. The
-    // head-hash phase cannot separate these; only the full hash can.
+    // Same size, identical except the very last byte. The scanner's head-hash
+    // phase reads only the first 16 KiB, so it cannot tell these apart and they
+    // survive into the full-hash phase, which must then reject them. This is the
+    // case where a cheap prefix check would produce a false duplicate.
     let mut head_a = filler(30, 200_000);
     let mut head_b = head_a.clone();
     *head_a.last_mut().expect("non-empty") = 0x01;
@@ -199,7 +201,7 @@ fn report(root: &Path, hardlinked: bool) {
     println!("\nDeliberately NOT reported, and why:");
     println!("  unique/*             unique content, and two different sizes");
     println!("  tricky/same-size-*   equal size, different content");
-    println!("  tricky/same-head-*   equal first 100 KiB, differ in the last byte");
+    println!("  tricky/same-head-*   200 KB each, differ only in the final byte");
     println!("  empty/*              0-byte files      (see --include-empty)");
     println!("  .hidden-vacation.jpg hidden            (see --hidden)");
     println!("  build/*              gitignored        (see --no-gitignore)");
