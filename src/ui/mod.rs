@@ -517,8 +517,12 @@ mod tests {
         let after = rendered_text(&mut app, 120, 30);
         assert_ne!(before, after, "selecting a group must change the list");
         assert!(
-            after.contains("* "),
-            "a selected row needs a visible marker:\n{after}"
+            after.contains('\u{2713}'),
+            "a selected row needs a visible tick:\n{after}"
+        );
+        assert!(
+            !before.contains('\u{2713}'),
+            "an unselected list must carry no tick:\n{before}"
         );
     }
 

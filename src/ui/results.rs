@@ -107,10 +107,13 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
             let size = format!("{:>10}", format::bytes(g.size));
             let count = format!(" ×{:<3}", g.files.len());
             let selected = app.is_selected(idx);
-            // ASCII only: glyphs whose rendered width disagrees with
-            // unicode-width were already removed from this UI once.
-            let marker = if selected { "* " } else { "  " };
-            let used = marker.len() + size.chars().count() + count.chars().count() + 1;
+            // U+2713, the same Dingbats block and width class as the U+2717 the
+            // files pane already renders correctly. Deliberately not U+2714
+            // HEAVY CHECK MARK, which carries emoji presentation and is drawn
+            // two cells wide while unicode-width measures it as one -- the bug
+            // that made "Bksp up" run together.
+            let marker = if selected { "✓ " } else { "  " };
+            let used = marker.chars().count() + size.chars().count() + count.chars().count() + 1;
             let name = format::truncate(&g.label(), inner_width.saturating_sub(used));
 
             let name_style = if g.skipped {

@@ -213,6 +213,29 @@ git tag v0.1.1 && git push origin v0.1.1
 and Windows for every push and pull request, plus a job pinned to the minimum
 supported Rust version so `rust-version` in `Cargo.toml` cannot drift.
 
+## A tree to try it on
+
+Testing a deletion tool means deleting things, so the sample tree is generated
+rather than committed — re-run this whenever you want it back:
+
+```sh
+cargo run --example make-testdata          # creates ./testdata
+cargo run --example make-testdata -- /tmp/x   # or somewhere else
+cargo run --release -- testdata            # scan it
+```
+
+It prints the result the scan should produce (4 groups, 7 duplicates, 4.45 MiB)
+and lists what it deliberately leaves un-duplicated and why — equal-size files
+with different content, two files sharing their first 100 KiB but differing in
+the final byte, 0-byte files, a hidden copy, a gitignored copy, and a hardlink
+pair. Those exist to prove matching is by content, not by size, name or head.
+
+`apps/*/shared.dll` and `system/shared.dll` are four copies of one library, the
+case group selection is for: mark the group with `m` and `x` to protect it.
+
+The generator refuses to touch a directory it did not create, so pointing it at
+a real folder cannot wipe it.
+
 ## Tests
 
 ```sh
