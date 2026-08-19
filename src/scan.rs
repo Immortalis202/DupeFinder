@@ -275,13 +275,31 @@ fn full_hash_pass(
     Some(buckets)
 }
 
+/// Put candidates in path order, so that reads walk the tree instead of
+/// jumping around it.
+///
+/// Both hashing passes build their input by flattening a `HashMap`, whose
+/// iteration order is arbitrary, so the reads were issued in effectively random
+/// order across the whole tree. On a spinning disk that is the worst case: every
+/// file costs a full seek, and small files spend all their time waiting for the
+/// head rather than transferring. Path order is not physical order, but files in
+/// one directory are usually allocated together, so it is a good proxy -- and
+/// because rayon splits the slice into contiguous ranges, each worker then walks
+/// its own run of neighbouring files instead of the whole tree.
+///
+/// Costs one sort of the candidate paths, which is nothing next to the I/O it
+/// saves. On an SSD, where seeks are free, it changes little either way.
+fn sort_for_sequential_reads(candidates: &mut [Candidate]) {
+    candidates.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+}
+
 /// Hash many files across the rayon pool, reporting progress and swallowing
 /// per-file I/O errors. Returns `None` if the scan was cancelled.
 ///
 /// Parallelism is across files rather than within one file (`update_rayon`) so
 /// the thread pool is not oversubscribed.
 fn hash_in_parallel<F>(
-    candidates: Vec<Candidate>,
+    mut candidates: Vec<Candidate>,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
     started: Instant,
@@ -290,6 +308,10 @@ fn hash_in_parallel<F>(
 where
     F: Fn(&Path) -> std::io::Result<([u8; 32], u64)> + Send + Sync,
 {
+    // Sorted before the mark, since ordering is not reading and must not count
+    // against the reported rate.
+    sort_for_sequential_reads(&mut candidates);
+
     if !candidates.is_empty() {
         state.mark_hashing_started(started.elapsed());
     }
@@ -450,6 +472,32 @@ mod tests {
             }
         }
         groups
+    }
+
+    /// Reads are issued in candidate order, and both passes build their input
+    /// from a `HashMap`, so without this the disk head jumps across the tree.
+    #[test]
+    fn candidates_are_read_in_path_order() {
+        let mut candidates: Vec<Candidate> =
+            ["z/last.bin", "a/second.bin", "a/first.bin", "m/middle.bin"]
+                .iter()
+                .map(|p| Candidate {
+                    path: PathBuf::from(p),
+                    size: 1,
+                })
+                .collect();
+
+        sort_for_sequential_reads(&mut candidates);
+
+        let order: Vec<String> = candidates
+            .iter()
+            .map(|c| c.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            order,
+            ["a/first.bin", "a/second.bin", "m/middle.bin", "z/last.bin"],
+            "files in one directory must be read as a run, not scattered"
+        );
     }
 
     /// Each group rendered as its sorted set of file names, for order-independent
