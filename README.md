@@ -154,22 +154,32 @@ Prebuilt binaries are on the [releases page](https://github.com/Immortalis202/Du
 
 ## Releases
 
-Releases are driven by the version in `Cargo.toml`. Bump it, push to `main`, and
-the release publishes itself with Linux and Windows binaries attached:
+Releases are driven by the `version` in `Cargo.toml`. Bump it and push to `main`;
+the release publishes itself with the Windows `.exe` and the Linux tarball
+attached.
+
+`Cargo.lock` records this package's own version and CI builds with `--locked`, so
+the lockfile has to be refreshed in the same commit or the build fails with
+*"cannot update the lock file ... because --locked was passed"*:
 
 ```sh
-# edit Cargo.toml -> version = "0.2.0"
-git commit -am "Release 0.2.0"
+# 1. bump the version in Cargo.toml, e.g. 0.1.0 -> 0.1.1
+# 2. refresh Cargo.lock
+cargo check
+# 3. commit both files together, then push
+git commit -am "Release 0.1.1"
 git push
 ```
 
-Pushing an ordinary commit that does not change the version builds nothing. A
-hand-pushed tag works too, and must agree with `Cargo.toml` or the workflow
-fails rather than publishing binaries whose `--version` disagrees with the
-release name:
+With [cargo-edit](https://github.com/killercup/cargo-edit) installed,
+`cargo set-version 0.1.1` does steps 1 and 2 in one go.
+
+Pushing a commit that does not change the version builds nothing. A hand-pushed
+tag also works and must agree with `Cargo.toml`, or the workflow fails rather
+than publishing binaries whose `--version` disagrees with the release name:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 `.github/workflows/ci.yml` runs formatting, clippy and the tests on both Linux
