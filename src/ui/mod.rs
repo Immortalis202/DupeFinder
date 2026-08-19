@@ -111,6 +111,7 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
                 crate::delete::DeleteMode::Trash => ("t", "mode:trash"),
                 crate::delete::DeleteMode::Permanent => ("t", "mode:PERM"),
             });
+            keys.push(("Del", "delete this file"));
             keys.push(("D", "delete marked"));
             keys.push(("r", "rescan"));
             keys.push(("q", "quit"));
@@ -367,6 +368,7 @@ mod tests {
                     message: "permission denied".into(),
                 }],
                 mode_label: "Trash".into(),
+                deleted_paths: vec![PathBuf::from("/gone/a.bin")],
             });
             let _ = rendered_text(&mut app, 100, 30);
         }
@@ -435,6 +437,42 @@ mod tests {
         assert!(
             text.contains("PERMANENT") || text.contains("permanently"),
             "a permanent delete must be labelled as such:\n{text}"
+        );
+    }
+
+    /// The single-file confirmation must name the file, since which file it is
+    /// is the only thing the user needs to check.
+    #[test]
+    fn the_single_delete_confirmation_names_the_file() {
+        let mut app = app_with_results();
+        app.plan = crate::app::DeletePlan::Single { group: 0, file: 1 };
+        app.screen = Screen::Confirm;
+        let text = rendered_text(&mut app, 100, 30);
+
+        assert!(
+            text.contains("this one file"),
+            "should be worded as a single delete:\n{text}"
+        );
+        assert!(
+            text.contains("IMG_0421.JPG"),
+            "the target file must be named:\n{text}"
+        );
+        assert!(
+            text.contains("would remain"),
+            "should say how many copies survive:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_single_delete_is_called_out() {
+        let mut app = app_with_results();
+        app.plan = crate::app::DeletePlan::Single { group: 0, file: 1 };
+        app.delete_mode = DeleteMode::Permanent;
+        app.screen = Screen::Confirm;
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("PERMANENTLY") || text.contains("permanently"),
+            "permanent single deletes must be labelled:\n{text}"
         );
     }
 

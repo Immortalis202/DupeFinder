@@ -7,20 +7,33 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::{ACCENT, DELETE, DIM, KEEP, WARN, centered, header_block, stat, stat_line};
-use crate::app::App;
+use crate::app::{App, DeletePlan};
 use crate::delete::DeleteMode;
 use crate::format;
 
 /// The point of no return. States exactly what will happen, in the terms the
 /// user cares about: how many files, how much space, and whether it is undoable.
 pub fn draw_confirm(frame: &mut Frame, app: &App) {
+    let permanent = app.delete_mode == DeleteMode::Permanent;
+
+    // A single-file delete gets its own wording: the one thing that matters is
+    // which file, so it is named in full rather than counted.
+    if let DeletePlan::Single { group, file } = app.plan {
+        let target = app
+            .groups
+            .get(group)
+            .and_then(|g| g.files.get(file))
+            .map(|f| (f.path.to_string_lossy().into_owned(), f.size));
+        draw_single_confirm(frame, app, target, permanent);
+        return;
+    }
+
     let area = centered(frame.area(), 68, 13);
     // Clear first: the dashboard underneath must not bleed through.
     frame.render_widget(Clear, area);
 
     let count = app.total_marked();
     let bytes = app.total_reclaimable();
-    let permanent = app.delete_mode == DeleteMode::Permanent;
 
     let (verdict, verdict_style) = if permanent {
         (
@@ -106,6 +119,107 @@ pub fn draw_confirm(frame: &mut Frame, app: &App) {
                         " confirm PERMANENT deletion "
                     } else {
                         " confirm deletion "
+                    },
+                    Style::default().fg(border).add_modifier(Modifier::BOLD),
+                ))),
+        ),
+        area,
+    );
+}
+
+/// Confirmation for deleting one specific file.
+fn draw_single_confirm(
+    frame: &mut Frame,
+    app: &App,
+    target: Option<(String, u64)>,
+    permanent: bool,
+) {
+    let area = centered(frame.area(), 72, 12);
+    frame.render_widget(Clear, area);
+
+    let Some((path, size)) = target else {
+        return;
+    };
+    let remaining = app
+        .groups
+        .get(match app.plan {
+            DeletePlan::Single { group, .. } => group,
+            DeletePlan::Marked => usize::MAX,
+        })
+        .map(|g| g.files.len().saturating_sub(1))
+        .unwrap_or(0);
+
+    let (verdict, verdict_style) = if permanent {
+        (
+            "This file will be destroyed permanently and cannot be recovered.",
+            Style::default().fg(DELETE).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "It moves to the Recycle Bin / Trash and can be restored.",
+            Style::default().fg(KEEP),
+        )
+    };
+
+    let body = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Delete this one file?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format::truncate_path(&path, 68),
+            Style::default().fg(DELETE),
+        )),
+        Line::from(vec![
+            Span::styled("Frees ", Style::default().fg(DIM)),
+            Span::styled(
+                format::bytes(size),
+                Style::default().fg(KEEP).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  {} cop{} of this content would remain",
+                    remaining,
+                    if remaining == 1 { "y" } else { "ies" }
+                ),
+                Style::default().fg(DIM),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(verdict, verdict_style)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "y / Enter",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  delete it     ", Style::default().fg(DIM)),
+            Span::styled(
+                "t",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  switch to ", Style::default().fg(DIM)),
+            Span::styled(app.delete_mode.toggled().label(), Style::default().fg(WARN)),
+            Span::styled("     ", Style::default()),
+            Span::styled(
+                "Esc",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  cancel", Style::default().fg(DIM)),
+        ]),
+    ];
+
+    let border = if permanent { DELETE } else { WARN };
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: true }).block(
+            Block::bordered()
+                .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
+                .title(Line::from(Span::styled(
+                    if permanent {
+                        " delete file PERMANENTLY "
+                    } else {
+                        " delete file "
                     },
                     Style::default().fg(border).add_modifier(Modifier::BOLD),
                 ))),

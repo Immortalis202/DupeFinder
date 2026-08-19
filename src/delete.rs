@@ -50,6 +50,10 @@ pub struct DeleteReport {
     pub bytes_freed: u64,
     pub failures: Vec<DeleteFailure>,
     pub mode_label: String,
+    /// Exactly what left the disk. The dashboard prunes against this rather
+    /// than re-deriving it from the marks, which would be wrong whenever the
+    /// deleted file was a keeper -- as it is for a single-file delete.
+    pub deleted_paths: Vec<PathBuf>,
 }
 
 /// Live counters for the deletion progress screen.
@@ -145,6 +149,7 @@ pub fn run(
             Ok(()) => {
                 report.deleted += 1;
                 report.bytes_freed += size;
+                report.deleted_paths.push(path);
                 state.done.fetch_add(1, Ordering::Relaxed);
                 state.bytes_freed.fetch_add(size, Ordering::Relaxed);
             }

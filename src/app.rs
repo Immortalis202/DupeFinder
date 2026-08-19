@@ -34,6 +34,15 @@ pub enum Pane {
     Files,
 }
 
+/// What a confirmed deletion will remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletePlan {
+    /// Every copy currently marked, across all groups.
+    Marked,
+    /// A single file picked out in the files pane.
+    Single { group: usize, file: usize },
+}
+
 /// One row in the directory browser.
 #[derive(Debug, Clone)]
 pub struct DirEntryRow {
@@ -79,6 +88,7 @@ pub struct App {
     pub pane: Pane,
     pub sort: SortKey,
     pub status: Option<String>,
+    pub plan: DeletePlan,
 
     // Delete
     pub delete_state: Arc<DeleteState>,
@@ -112,6 +122,7 @@ impl App {
             pane: Pane::Groups,
             sort: SortKey::Wasted,
             status: None,
+            plan: DeletePlan::Marked,
             delete_state: Arc::new(DeleteState::default()),
             delete_rx: None,
             report: None,
@@ -388,8 +399,21 @@ impl App {
 
     // ---------------------------------------------------------------- delete
 
+    /// The files the current plan would remove.
+    pub fn planned_targets(&self) -> Vec<(PathBuf, u64)> {
+        match self.plan {
+            DeletePlan::Marked => delete::pending(&self.groups),
+            DeletePlan::Single { group, file } => self
+                .groups
+                .get(group)
+                .and_then(|g| g.files.get(file))
+                .map(|f| vec![(f.path.clone(), f.size)])
+                .unwrap_or_default(),
+        }
+    }
+
     fn start_delete(&mut self) {
-        let targets = delete::pending(&self.groups);
+        let targets = self.planned_targets();
         if targets.is_empty() {
             self.screen = Screen::Results;
             self.status = Some("Nothing marked for deletion".to_string());
@@ -412,19 +436,25 @@ impl App {
     pub fn handle_delete_msg(&mut self, msg: DeleteMsg) {
         match msg {
             DeleteMsg::Done(report) => {
-                // Drop the entries that are gone, so a rescan is not required to
-                // see an accurate picture. Files that failed to delete are still
-                // on disk and must stay listed.
-                let failed: HashSet<PathBuf> =
-                    report.failures.iter().map(|f| f.path.clone()).collect();
+                // Prune exactly what left the disk, so a rescan is not needed
+                // to see an accurate picture. Going by the marks instead would
+                // drop the wrong rows after a single-file delete, where the
+                // removed file may well have been the keeper.
+                let gone: HashSet<&PathBuf> = report.deleted_paths.iter().collect();
                 for group in &mut self.groups {
-                    let skipped = group.skipped;
-                    group
-                        .files
-                        .retain(|f| f.keep || skipped || failed.contains(&f.path));
+                    group.files.retain(|f| !gone.contains(&f.path));
                 }
+                // A lone remaining copy is not a duplicate any more.
                 self.groups.retain(|g| g.files.len() > 1);
+                // Deleting a keeper leaves the group with none, so restore the
+                // one-keeper invariant rather than letting it drift.
+                for group in &mut self.groups {
+                    if group.keeper_count() == 0 {
+                        group.apply_strategy(KeepStrategy::First);
+                    }
+                }
                 self.clamp_selection();
+                self.plan = DeletePlan::Marked;
 
                 self.report = Some(report);
                 self.delete_rx = None;
@@ -595,9 +625,27 @@ impl App {
                 if self.total_marked() == 0 {
                     self.status = Some("Nothing marked for deletion".to_string());
                 } else {
+                    self.plan = DeletePlan::Marked;
                     self.screen = Screen::Confirm;
                 }
             }
+            // Delete just the highlighted copy, whatever its mark. Useful when
+            // one file is obviously junk and the rest need no decision.
+            KeyCode::Delete => match self.groups.get(self.group_selected) {
+                Some(group) if group.files.len() > 1 => {
+                    self.pane = Pane::Files;
+                    self.plan = DeletePlan::Single {
+                        group: self.group_selected,
+                        file: self.file_selected,
+                    };
+                    self.screen = Screen::Confirm;
+                }
+                Some(_) => {
+                    self.status =
+                        Some("This is the last copy of the file - nothing to delete".to_string());
+                }
+                None => {}
+            },
             KeyCode::Char('r') => {
                 if let Some(root) = self.scan_root.clone() {
                     self.start_scan(root);
@@ -1085,11 +1133,17 @@ mod tests {
     #[test]
     fn a_successful_delete_removes_the_entries_from_the_dashboard() {
         let mut app = app_with_results();
+        // Everything that was marked actually went.
+        let gone: Vec<PathBuf> = delete::pending(&app.groups)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
-            deleted: 3,
+            deleted: gone.len() as u64,
             bytes_freed: 2_050,
             failures: Vec::new(),
             mode_label: "Trash".into(),
+            deleted_paths: gone,
         }));
 
         assert_eq!(app.screen, Screen::Done);
@@ -1102,16 +1156,18 @@ mod tests {
     #[test]
     fn files_that_failed_to_delete_stay_listed() {
         let mut app = app_with_results();
-        // The second copy of group 0 could not be removed.
+        // The second copy of group 0 could not be removed; the third could.
         let stuck = app.groups[0].files[1].path.clone();
+        let went = app.groups[0].files[2].path.clone();
         app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
-            deleted: 2,
-            bytes_freed: 1_050,
+            deleted: 1,
+            bytes_freed: 1_000,
             failures: vec![DeleteFailure {
                 path: stuck.clone(),
                 message: "permission denied".into(),
             }],
             mode_label: "Trash".into(),
+            deleted_paths: vec![went.clone()],
         }));
 
         let still_there = app
@@ -1123,6 +1179,15 @@ mod tests {
             still_there,
             "a file that is still on disk must still be shown"
         );
+        let removed = app
+            .groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .all(|f| f.path != went);
+        assert!(
+            removed,
+            "the file that was deleted must be gone from the list"
+        );
     }
 
     #[test]
@@ -1130,11 +1195,22 @@ mod tests {
         let mut app = app_with_results();
         app.groups[0].skipped = true;
         let before = app.groups[0].files.len();
+        // Only the other group's marked copy was deleted.
+        let gone: Vec<PathBuf> = delete::pending(&app.groups)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert!(
+            gone.iter()
+                .all(|p| !p.starts_with("/aaa") && p != &PathBuf::from("/b.jpg")),
+            "a skipped group contributes no targets"
+        );
         app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
-            deleted: 1,
+            deleted: gone.len() as u64,
             bytes_freed: 50,
             failures: Vec::new(),
             mode_label: "Trash".into(),
+            deleted_paths: gone,
         }));
         let group = app
             .groups
@@ -1142,6 +1218,161 @@ mod tests {
             .find(|g| g.hash == [1u8; 32])
             .expect("the skipped group should still be listed");
         assert_eq!(group.files.len(), before);
+    }
+
+    // Single-file delete: the files pane needs a way to remove exactly the
+    // highlighted copy, without unmarking everything else first.
+    #[test]
+    fn delete_key_targets_only_the_highlighted_file() {
+        let mut app = app_with_results();
+        app.pane = Pane::Files;
+        app.file_selected = 2;
+        let target = app.groups[0].files[2].path.clone();
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.screen, Screen::Confirm);
+        assert_eq!(
+            app.plan,
+            DeletePlan::Single { group: 0, file: 2 },
+            "the plan should name the highlighted file"
+        );
+
+        let targets = app.planned_targets();
+        assert_eq!(targets.len(), 1, "exactly one file");
+        assert_eq!(targets[0].0, target);
+    }
+
+    #[test]
+    fn delete_key_can_remove_a_copy_that_is_the_keeper() {
+        let mut app = app_with_results();
+        app.pane = Pane::Files;
+        // Index 0 is the keeper after the default strategy.
+        app.file_selected = 0;
+        assert!(app.groups[0].files[0].keep);
+
+        press(&mut app, KeyCode::Delete);
+        let targets = app.planned_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].0, app.groups[0].files[0].path,
+            "the user may delete the keeper if that is what they highlighted"
+        );
+    }
+
+    #[test]
+    fn deleting_the_keeper_leaves_the_group_with_a_new_one() {
+        let mut app = app_with_results();
+        let keeper = app.groups[0].files[0].path.clone();
+        assert!(app.groups[0].files[0].keep);
+
+        app.plan = DeletePlan::Single { group: 0, file: 0 };
+        app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
+            deleted: 1,
+            bytes_freed: 1_000,
+            failures: Vec::new(),
+            mode_label: "Trash".into(),
+            deleted_paths: vec![keeper.clone()],
+        }));
+
+        let group = app
+            .groups
+            .iter()
+            .find(|g| g.hash == [1u8; 32])
+            .expect("two copies remain, so the group stands");
+        assert!(
+            group.files.iter().all(|f| f.path != keeper),
+            "keeper removed"
+        );
+        assert_eq!(
+            group.keeper_count(),
+            1,
+            "the one-keeper invariant must be restored, not left at zero"
+        );
+    }
+
+    #[test]
+    fn a_single_delete_that_empties_a_group_drops_the_group() {
+        let mut app = app_with_results();
+        // Group 1 has exactly two copies; removing one leaves no duplicate.
+        let victim = app.groups[1].files[0].path.clone();
+        app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
+            deleted: 1,
+            bytes_freed: 50,
+            failures: Vec::new(),
+            mode_label: "Trash".into(),
+            deleted_paths: vec![victim],
+        }));
+        assert!(
+            !app.groups.iter().any(|g| g.hash == [2u8; 32]),
+            "a lone remaining copy is not a duplicate any more"
+        );
+    }
+
+    #[test]
+    fn delete_key_refuses_when_only_one_copy_is_left() {
+        let mut app = app_with_results();
+        app.groups[0].files.truncate(1);
+        app.group_selected = 0;
+        app.pane = Pane::Files;
+        app.file_selected = 0;
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.screen, Screen::Results, "no confirmation should open");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("last copy"),
+            "the user should be told why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn delete_key_on_an_empty_result_set_is_harmless() {
+        let mut app = app_with_results();
+        app.groups.clear();
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.screen, Screen::Results);
+    }
+
+    #[test]
+    fn escaping_a_single_delete_confirmation_deletes_nothing() {
+        let mut app = app_with_results();
+        app.pane = Pane::Files;
+        app.file_selected = 1;
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.screen, Screen::Confirm);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Results);
+        assert_eq!(app.groups[0].files.len(), 3, "nothing removed");
+    }
+
+    #[test]
+    fn the_plan_resets_to_marked_after_a_single_delete() {
+        let mut app = app_with_results();
+        let victim = app.groups[0].files[1].path.clone();
+        app.plan = DeletePlan::Single { group: 0, file: 1 };
+        app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
+            deleted: 1,
+            bytes_freed: 1_000,
+            failures: Vec::new(),
+            mode_label: "Trash".into(),
+            deleted_paths: vec![victim],
+        }));
+        assert_eq!(
+            app.plan,
+            DeletePlan::Marked,
+            "a later D must not reuse the stale single-file plan"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_still_plans_every_marked_copy() {
+        let mut app = app_with_results();
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.plan, DeletePlan::Marked);
+        assert_eq!(app.planned_targets().len(), app.total_marked());
     }
 
     #[test]

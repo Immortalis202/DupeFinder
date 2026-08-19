@@ -84,7 +84,13 @@ nothing on a file and `s` falls back to scanning the containing directory. The
 
 **Dashboard** — `Tab` switch pane · `↑↓` move · `Space` keep the highlighted copy ·
 `d` toggle one mark · `x` skip the whole group · `s` cycle sort ·
-`t` Trash / permanent · `D` delete the marked copies · `r` rescan · `q` quit
+`t` Trash / permanent · `Del` delete just the highlighted file ·
+`D` delete the marked copies · `r` rescan · `q` quit
+
+`Del` is the direct route when one copy is obviously the junk one: it deletes
+exactly the highlighted file, whatever its mark, without needing you to unmark
+everything else first. It confirms, names the file, and says how many copies
+would remain. It refuses on the last remaining copy.
 
 Bulk keeper choices, applied to **every** group at once:
 
@@ -102,6 +108,8 @@ Bulk keeper choices, applied to **every** group at once:
 - **Every group always keeps at least one copy.** This is enforced in the data
   model, not just in the UI: `toggle_mark` refuses to clear a group's last
   keeper, so marking every copy of a file for deletion cannot be expressed.
+  A single-file delete may remove the keeper, and the group then picks a new one
+  rather than being left with none.
 - **Deletion goes to the Recycle Bin / Trash by default** and is recoverable.
   Permanent deletion requires switching mode with `t`, and the confirmation
   dialog says plainly which one is about to happen.
@@ -197,7 +205,7 @@ supported Rust version so `rust-version` in `Cargo.toml` cannot drift.
 cargo test
 ```
 
-112 tests covering the scanner against fixture trees with known answers
+123 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.
