@@ -800,6 +800,39 @@ mod tests {
         );
     }
 
+    /// The rate must stay blank until reading starts, then divide by reading
+    /// time. Dividing by total scan time made it understate the disk badly.
+    #[test]
+    fn the_read_rate_waits_for_reading_to_begin() {
+        let mut app = app_with_results();
+        app.screen = Screen::Scanning;
+        app.phase = Phase::Walking;
+        // A scan that started 10s ago and has read 1 MiB.
+        app.scan_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        crate::model::ScanState::bump(&app.scan_state.bytes_hashed, 1024 * 1024);
+
+        // Nothing has been read yet, so there is no rate to report -- even
+        // though a byte counter exists.
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("read rate"),
+            "the label should be shown:\n{text}"
+        );
+        assert!(
+            !text.contains("MiB/s"),
+            "no rate before reading starts:\n{text}"
+        );
+
+        // Reading began 2s into the scan, so 8s of the 10s was reading.
+        app.scan_state
+            .mark_hashing_started(std::time::Duration::from_secs(2));
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("/s"),
+            "a rate should appear once reading has begun:\n{text}"
+        );
+    }
+
     #[test]
     fn the_focused_pane_is_visually_distinct() {
         let mut app = app_with_results();

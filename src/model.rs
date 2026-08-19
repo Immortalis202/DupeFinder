@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// One file on disk belonging to a duplicate group.
 #[derive(Debug, Clone)]
@@ -342,6 +342,14 @@ pub struct ScanState {
     pub errors: AtomicU64,
     pub current: Mutex<String>,
     pub cancel: AtomicBool,
+    /// Milliseconds from scan start to the moment the first byte was read; 0
+    /// until then.
+    ///
+    /// The throughput figure must divide bytes read by the time spent reading,
+    /// not by total scan time. The walk touches every file's metadata and can
+    /// dominate a large tree, which made the reported rate a small fraction of
+    /// what the disk was actually delivering.
+    pub hash_started_ms: AtomicU64,
 }
 
 impl ScanState {
@@ -359,6 +367,26 @@ impl ScanState {
 
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Record when reading began. Only the first call counts, since the head
+    /// and full hash passes both read and both go through here.
+    pub fn mark_hashing_started(&self, since_scan_start: Duration) {
+        // Clamp to 1ms so an immediate start is not mistaken for "not started".
+        let ms = (since_scan_start.as_millis() as u64).max(1);
+        let _ = self
+            .hash_started_ms
+            .compare_exchange(0, ms, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// How long has been spent reading file contents, given the total elapsed
+    /// scan time. `None` before any reading starts.
+    pub fn hashing_elapsed(&self, total: Duration) -> Option<Duration> {
+        let started = self.hash_started_ms.load(Ordering::Relaxed);
+        if started == 0 {
+            return None;
+        }
+        total.checked_sub(Duration::from_millis(started))
     }
 
     pub fn set_current(&self, path: &str) {
@@ -526,6 +554,73 @@ mod tests {
     fn hash_prefix_is_stable_hex() {
         let g = DupeGroup::new([0xABu8; 32], 1, vec![]);
         assert_eq!(g.hash_prefix(), "ababababab ab".replace(' ', ""));
+    }
+
+    // The throughput figure divides bytes read by time spent reading. Dividing
+    // by total scan time understated it badly whenever the walk was slow.
+    #[test]
+    fn hashing_elapsed_is_none_before_any_reading() {
+        let state = ScanState::default();
+        assert!(state.hashing_elapsed(Duration::from_secs(30)).is_none());
+    }
+
+    #[test]
+    fn hashing_elapsed_excludes_the_walk() {
+        let state = ScanState::default();
+        // The walk took 40s; reading began after it.
+        state.mark_hashing_started(Duration::from_secs(40));
+        // 50s into the scan, only 10s of that was reading.
+        assert_eq!(
+            state.hashing_elapsed(Duration::from_secs(50)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn only_the_first_mark_counts() {
+        let state = ScanState::default();
+        // Both hash passes report, but the rate must span from the first read.
+        state.mark_hashing_started(Duration::from_secs(5));
+        state.mark_hashing_started(Duration::from_secs(9));
+        assert_eq!(
+            state.hashing_elapsed(Duration::from_secs(10)),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn an_immediate_start_still_registers_as_started() {
+        let state = ScanState::default();
+        // Zero would be indistinguishable from "not started", so it clamps.
+        state.mark_hashing_started(Duration::ZERO);
+        assert!(state.hashing_elapsed(Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn a_stale_total_does_not_underflow() {
+        let state = ScanState::default();
+        state.mark_hashing_started(Duration::from_secs(10));
+        // The UI reads counters and elapsed separately, so a total that is
+        // momentarily behind the mark must not panic.
+        assert_eq!(state.hashing_elapsed(Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn the_rate_would_be_understated_by_total_scan_time() {
+        // 1 GiB read in 10s, after a 40s walk: 100 MiB/s, not 20 MiB/s.
+        let state = ScanState::default();
+        state.mark_hashing_started(Duration::from_secs(40));
+        let total = Duration::from_secs(50);
+        let reading = state.hashing_elapsed(total).unwrap();
+        let bytes = 1024u64 * 1024 * 1024;
+        let honest = bytes / reading.as_secs();
+        let diluted = bytes / total.as_secs();
+        assert_eq!(honest, 107_374_182);
+        assert!(
+            honest > diluted * 4,
+            "dividing by total scan time understates the rate {}x",
+            honest / diluted
+        );
     }
 
     #[test]

@@ -14,10 +14,11 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use ignore::WalkBuilder;
@@ -45,6 +46,10 @@ struct Candidate {
 /// Run a full scan. Intended to be called on a dedicated thread; progress is
 /// published through `state` and stage transitions through `tx`.
 pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sender<ScanMsg>) {
+    // The UI's throughput figure needs to know when reading began, separately
+    // from when the scan began.
+    let started = Instant::now();
+
     let by_size = match walk(&root, &options, &state, &tx) {
         Some(map) => map,
         None => {
@@ -65,7 +70,7 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     }
 
     let _ = tx.send(ScanMsg::Phase(Phase::HeadHashing));
-    let candidates = match head_hash_pass(candidates, &state, &tx) {
+    let candidates = match head_hash_pass(candidates, &state, &tx, started) {
         Some(c) => c,
         None => {
             let _ = tx.send(ScanMsg::Cancelled);
@@ -78,7 +83,7 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     state.files_hashed.store(0, Ordering::Relaxed);
 
     let _ = tx.send(ScanMsg::Phase(Phase::FullHashing));
-    let groups = match full_hash_pass(candidates, &state, &tx) {
+    let groups = match full_hash_pass(candidates, &state, &tx, started) {
         Some(g) => g,
         None => {
             let _ = tx.send(ScanMsg::Cancelled);
@@ -220,6 +225,7 @@ fn head_hash_pass(
     candidates: Vec<Candidate>,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
+    started: Instant,
 ) -> Option<Vec<Candidate>> {
     // Files too small to benefit skip straight to the full hash.
     let (large, small): (Vec<_>, Vec<_>) = candidates
@@ -230,7 +236,7 @@ fn head_hash_pass(
         return Some(small);
     }
 
-    let hashed = hash_in_parallel(large, state, tx, |path| {
+    let hashed = hash_in_parallel(large, state, tx, started, |path| {
         hash_prefix_of(path, HEAD_HASH_BYTES)
     })?;
 
@@ -257,8 +263,9 @@ fn full_hash_pass(
     candidates: Vec<Candidate>,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
+    started: Instant,
 ) -> Option<HashMap<[u8; 32], Vec<Candidate>>> {
-    let hashed = hash_in_parallel(candidates, state, tx, hash_whole_file)?;
+    let hashed = hash_in_parallel(candidates, state, tx, started, hash_whole_file)?;
 
     let mut buckets: HashMap<[u8; 32], Vec<Candidate>> = HashMap::new();
     for (candidate, hash) in hashed {
@@ -277,11 +284,16 @@ fn hash_in_parallel<F>(
     candidates: Vec<Candidate>,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
+    started: Instant,
     hasher: F,
 ) -> Option<Vec<(Candidate, [u8; 32])>>
 where
     F: Fn(&Path) -> std::io::Result<([u8; 32], u64)> + Send + Sync,
 {
+    if !candidates.is_empty() {
+        state.mark_hashing_started(started.elapsed());
+    }
+
     let out: Vec<_> = candidates
         .into_par_iter()
         .filter_map(|candidate| {
@@ -315,23 +327,34 @@ where
 }
 
 /// BLAKE3 of the whole file. Returns the digest and the number of bytes read.
+/// BLAKE3 of the whole file. Returns the digest and the number of bytes read.
 fn hash_whole_file(path: &Path) -> std::io::Result<([u8; 32], u64)> {
-    let file = File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(BufReader::with_capacity(READ_BUFFER, file))?;
-    let read = hasher.count();
-    Ok((*hasher.finalize().as_bytes(), read))
+    hash_upto(path, u64::MAX)
 }
 
 /// BLAKE3 of at most the first `limit` bytes.
 fn hash_prefix_of(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(READ_BUFFER, file).take(limit);
+    hash_upto(path, limit)
+}
+
+/// Hash up to `limit` bytes of `path`, reading through a heap buffer.
+///
+/// Deliberately not `blake3::Hasher::update_reader`: that puts a 64 KiB array on
+/// the stack, and because hashing runs inside a rayon parallel collect -- whose
+/// split recursion deepens with the thread count -- that frame was enough to
+/// overflow a worker's 2 MiB stack on a many-core machine scanning tens of
+/// thousands of files. Reading into a heap buffer keeps the frame small however
+/// deep the split tree gets, and also drops a redundant copy of every byte:
+/// `update_reader` buffers internally, so wrapping the file in a `BufReader`
+/// as well copied the data twice.
+fn hash_upto(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
+    let mut file = File::open(path)?.take(limit);
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; READ_BUFFER];
+    // Never allocate more than the caller could possibly read.
+    let mut buf = vec![0u8; READ_BUFFER.min(limit.max(1) as usize)];
     let mut total = 0u64;
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -698,6 +721,40 @@ mod tests {
         let mut sorted = wasted.clone();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(wasted, sorted, "most wasteful group should come first");
+    }
+
+    /// `hash_upto` replaced `blake3::Hasher::update_reader`, whose 64 KiB stack
+    /// array overflowed rayon worker stacks. It must still hash identically.
+    #[test]
+    fn a_prefix_hash_matches_hashing_the_same_bytes_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data).unwrap();
+
+        // Whole file.
+        let (digest, read) = hash_whole_file(&path).unwrap();
+        assert_eq!(read, data.len() as u64);
+        assert_eq!(digest, *blake3::hash(&data).as_bytes());
+
+        // A prefix, including one that straddles the read buffer.
+        for limit in [1u64, 16 * 1024, READ_BUFFER as u64 + 7, 299_999] {
+            let (digest, read) = hash_prefix_of(&path, limit).unwrap();
+            let want = &data[..limit as usize];
+            assert_eq!(read, want.len() as u64, "bytes read for limit {limit}");
+            assert_eq!(digest, *blake3::hash(want).as_bytes(), "digest for {limit}");
+        }
+    }
+
+    #[test]
+    fn hashing_an_empty_file_does_not_allocate_a_zero_length_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        // A zero limit must not panic on a zero-sized buffer.
+        let (digest, read) = hash_prefix_of(&path, 0).unwrap();
+        assert_eq!(read, 0);
+        assert_eq!(digest, *blake3::hash(b"").as_bytes());
     }
 
     #[test]
