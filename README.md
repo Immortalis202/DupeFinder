@@ -141,16 +141,27 @@ the thread pool is not oversubscribed.
 
 ## Releases
 
-Pushing a `v*` tag builds Linux and Windows binaries and publishes them to a
-GitHub release:
+Releases are driven by the version in `Cargo.toml`. Bump it, push to `main`, and
+the release publishes itself with Linux and Windows binaries attached:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+# edit Cargo.toml -> version = "0.2.0"
+git commit -am "Release 0.2.0"
+git push
 ```
 
-The tag must match the `version` in `Cargo.toml` — the workflow fails fast if it
-does not. `.github/workflows/ci.yml` runs formatting, clippy and the tests on
-both Linux and Windows for every push and pull request.
+Pushing an ordinary commit that does not change the version builds nothing. A
+hand-pushed tag works too, and must agree with `Cargo.toml` or the workflow
+fails rather than publishing binaries whose `--version` disagrees with the
+release name:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/ci.yml` runs formatting, clippy and the tests on both Linux
+and Windows for every push and pull request, plus a job pinned to the minimum
+supported Rust version so `rust-version` in `Cargo.toml` cannot drift.
 
 ## Tests
 

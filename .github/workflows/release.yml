@@ -1,11 +1,17 @@
 name: Release
 
+# Releases are driven by the version in Cargo.toml. Bump it, push to main, and
+# this publishes a release for it. Pushing a v* tag by hand also works.
+#
+# Note: a tag created by a workflow using the default GITHUB_TOKEN does not
+# trigger other workflows, so tagging and building must happen in one workflow
+# rather than tagging here and relying on an `on: push: tags` trigger elsewhere.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
-# Needed for softprops/action-gh-release to create the release and upload assets.
 permissions:
   contents: write
 
@@ -13,8 +19,52 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: decide
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Tags are needed to tell an already-released version from a new one.
+          fetch-depth: 0
+
+      - id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Hand-pushed tag: it must agree with Cargo.toml, or the published
+            # binaries would report a different --version than the release name.
+            tag="$GITHUB_REF_NAME"
+            if [ "${tag#v}" != "$version" ]; then
+              echo "::error::tag $tag does not match Cargo.toml version $version"
+              exit 1
+            fi
+            publish=true
+          else
+            tag="v$version"
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "$tag already released - nothing to do"
+              publish=false
+            else
+              publish=true
+            fi
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$version tag=$tag publish=$publish"
+
   build:
     name: ${{ matrix.target }}
+    needs: gate
+    # Ordinary pushes to main that do not change the version build nothing.
+    if: needs.gate.outputs.publish == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -28,21 +78,6 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@v7
-
-      # A tag that disagrees with Cargo.toml produces a release whose binaries
-      # report a different --version than the release name. Fail fast instead.
-      - name: Check tag matches Cargo.toml version
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          set -euo pipefail
-          crate=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          tag="${GITHUB_REF_NAME#v}"
-          echo "Cargo.toml=$crate tag=$tag"
-          if [ "$crate" != "$tag" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
-            exit 1
-          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,7 +94,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           set -euo pipefail
-          staging="dupefind-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          staging="dupefind-${{ needs.gate.outputs.tag }}-${{ matrix.target }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/dupefind" "$staging/"
           cp README.md "$staging/"
@@ -70,23 +105,40 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $staging = "dupefind-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $staging = "dupefind-${{ needs.gate.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/dupefind.exe" $staging
           Copy-Item README.md $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
           "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # Always keep the build output, so a workflow_dispatch run (no tag) is
-      # still useful and a failed release upload does not lose the binaries.
       - uses: actions/upload-artifact@v7
         with:
           name: dupefind-${{ matrix.target }}
           path: ${{ env.ASSET }}
+          if-no-files-found: error
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+  publish:
+    name: publish release
+    needs: [gate, build]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # One job creates the release, so the two build jobs cannot race to
+      # create the same tag.
+      - uses: actions/download-artifact@v8
         with:
-          files: ${{ env.ASSET }}
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la dist
+
+      # Creates the tag at this commit if it does not already exist.
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          name: ${{ needs.gate.outputs.tag }}
+          files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
