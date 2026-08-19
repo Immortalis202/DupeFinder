@@ -139,6 +139,19 @@ the thread pool is not oversubscribed.
   not what you want.
 - Paths are never assumed to be UTF-8; display is lossy rather than fatal.
 
+## Download
+
+Prebuilt binaries are on the [releases page](https://github.com/Immortalis202/DupeFinder/releases):
+
+- **Windows** — `dupefind-<version>-x86_64-pc-windows-msvc.exe`, a single
+  self-contained executable. Download and run it; there is nothing to unzip and
+  no Visual C++ Redistributable to install, because the MSVC runtime is linked
+  statically. Run it from Windows Terminal rather than double-clicking, since it
+  is a terminal application.
+- **Linux** — `dupefind-<version>-x86_64-unknown-linux-gnu.tar.gz`. A tarball
+  rather than a bare file so the executable bit survives the download:
+  `tar xzf dupefind-*.tar.gz && ./dupefind-*/dupefind`
+
 ## Releases
 
 Releases are driven by the version in `Cargo.toml`. Bump it, push to `main`, and

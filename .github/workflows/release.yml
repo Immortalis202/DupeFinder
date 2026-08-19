@@ -75,7 +75,7 @@ jobs:
             archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: zip
+            archive: exe
     steps:
       - uses: actions/checkout@v7
 
@@ -101,16 +101,30 @@ jobs:
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
 
+      # Shipped as a bare .exe so it can be downloaded and run directly, with no
+      # unzip step. .cargo/config.toml links the MSVC runtime statically, so it
+      # does not need the Visual C++ Redistributable.
       - name: Package (Windows)
-        if: matrix.archive == 'zip'
+        if: matrix.archive == 'exe'
         shell: pwsh
         run: |
-          $staging = "dupefind-${{ needs.gate.outputs.tag }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/dupefind.exe" $staging
-          Copy-Item README.md $staging
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $asset = "dupefind-${{ needs.gate.outputs.tag }}-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/dupefind.exe" $asset
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # dumpbin is not on PATH without the VS dev shell, so scan the import
+      # names directly: an imported DLL appears as an ASCII string in the file.
+      - name: Confirm the .exe needs no redistributable
+        if: matrix.archive == 'exe'
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("$env:ASSET")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -match 'VCRUNTIME') {
+            Write-Error "the .exe imports VCRUNTIME - crt-static did not apply, so it would need the VC++ Redistributable"
+            exit 1
+          }
+          Write-Host "OK: no VCRUNTIME import - the .exe is self-contained"
 
       - uses: actions/upload-artifact@v7
         with:
