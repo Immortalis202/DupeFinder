@@ -2,7 +2,7 @@
 //! the state machine can be exercised without a terminal.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -44,6 +44,9 @@ pub struct DirEntryRow {
     pub is_dir: bool,
     /// Size in bytes, for files only.
     pub size: Option<u64>,
+    /// A Windows drive root such as `D:\`, offered so the user can move
+    /// between disks. Never set on Unix, which has a single root.
+    pub is_drive: bool,
 }
 
 /// Everything the UI draws and the keys mutate.
@@ -126,6 +129,25 @@ impl App {
 
     // ---------------------------------------------------------------- picker
 
+    /// Build rows for the drives the user could switch to.
+    ///
+    /// Kept separate from enumeration so the ordering and filtering can be
+    /// tested on any platform.
+    pub(crate) fn drive_rows(drives: &[PathBuf], cwd: &Path) -> Vec<DirEntryRow> {
+        drives
+            .iter()
+            .filter(|d| d.as_path() != cwd)
+            .map(|d| DirEntryRow {
+                name: d.to_string_lossy().into_owned(),
+                path: d.clone(),
+                is_parent: false,
+                is_dir: true,
+                size: None,
+                is_drive: true,
+            })
+            .collect()
+    }
+
     /// Re-read the current directory. Unreadable directories surface as an
     /// in-screen error rather than crashing or silently showing nothing.
     pub fn refresh_entries(&mut self) {
@@ -139,7 +161,13 @@ impl App {
                 is_parent: true,
                 is_dir: true,
                 size: None,
+                is_drive: false,
             });
+        } else {
+            // Top of this drive: `..` leads nowhere, so the sibling drives take
+            // its place. This is how you get from C:\ to D:\ on Windows.
+            self.entries
+                .extend(Self::drive_rows(&available_drives(), &self.cwd));
         }
 
         match std::fs::read_dir(&self.cwd) {
@@ -165,6 +193,7 @@ impl App {
                         } else {
                             entry.metadata().ok().map(|m| m.len())
                         },
+                        is_drive: false,
                     };
                     if is_dir {
                         dirs.push(row);
@@ -469,6 +498,15 @@ impl App {
                 let root = self.scan_target();
                 self.start_scan(root);
             }
+            // Jump to the top of the current drive, which is where the other
+            // drives are listed.
+            KeyCode::Char('d') => {
+                if let Some(root) = self.cwd.ancestors().last() {
+                    self.cwd = root.to_path_buf();
+                    self.picker_selected = 0;
+                    self.refresh_entries();
+                }
+            }
             KeyCode::Char('.') => {
                 self.show_hidden_in_picker = !self.show_hidden_in_picker;
                 self.refresh_entries();
@@ -667,6 +705,25 @@ impl App {
     pub fn scanned_files(&self) -> u64 {
         self.scan_state.files_seen.load(Ordering::Relaxed)
     }
+}
+
+/// Drive roots the user can switch to.
+///
+/// Windows has no parent above `C:\`, so drives have to be enumerated to let
+/// the user reach another disk. Probing `A:\`..`Z:\` avoids a winapi
+/// dependency for what is 26 cheap stat calls, done only at a drive root.
+#[cfg(windows)]
+pub fn available_drives() -> Vec<PathBuf> {
+    (b'A'..=b'Z')
+        .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Unix has a single root, so there is nothing to switch between.
+#[cfg(not(windows))]
+pub fn available_drives() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Home directory without pulling in a crate for one lookup.
@@ -1321,6 +1378,91 @@ mod tests {
         assert_eq!(app.scan_target_label(), "two");
         press(&mut app, KeyCode::Up);
         assert_eq!(app.scan_target_label(), "one");
+    }
+
+    // Windows has no parent above C:\, so drives must be reachable some other
+    // way. These exercise the pure row builder, so they run on any platform.
+    #[test]
+    fn drive_rows_offer_the_other_drives() {
+        let drives = [
+            PathBuf::from("C:\\"),
+            PathBuf::from("D:\\"),
+            PathBuf::from("E:\\"),
+        ];
+        let rows = App::drive_rows(&drives, Path::new("C:\\"));
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["D:\\", "E:\\"],
+            "the current drive is not offered"
+        );
+        assert!(rows.iter().all(|r| r.is_drive && r.is_dir && !r.is_parent));
+    }
+
+    #[test]
+    fn drive_rows_are_empty_when_there_is_one_drive() {
+        let drives = [PathBuf::from("C:\\")];
+        assert!(App::drive_rows(&drives, Path::new("C:\\")).is_empty());
+    }
+
+    #[test]
+    fn drive_rows_are_empty_on_a_system_without_drives() {
+        // available_drives() returns nothing on Unix.
+        assert!(App::drive_rows(&[], Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn a_drive_row_is_a_valid_scan_target() {
+        let mut app = App::new(
+            std::env::temp_dir(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.entries = App::drive_rows(
+            &[PathBuf::from("C:\\"), PathBuf::from("D:\\")],
+            Path::new("C:\\"),
+        );
+        app.picker_selected = 0;
+        // Drives are directories, so `s` scans the whole disk.
+        assert_eq!(app.scan_target(), PathBuf::from("D:\\"));
+    }
+
+    #[test]
+    fn d_jumps_to_the_top_of_the_current_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let mut app = App::new(nested.clone(), ScanOptions::default(), DeleteMode::Trash);
+        press(&mut app, KeyCode::Char('d'));
+        // On Unix the top is `/`; on Windows it would be the drive root, which
+        // is where the drive rows are listed.
+        assert_eq!(app.cwd, PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+        assert_eq!(app.picker_selected, 0);
+    }
+
+    #[test]
+    fn available_drives_is_empty_on_unix() {
+        #[cfg(not(windows))]
+        assert!(available_drives().is_empty());
+        // On Windows there is always at least the system drive.
+        #[cfg(windows)]
+        assert!(!available_drives().is_empty());
+    }
+
+    #[test]
+    fn the_filesystem_root_lists_no_parent_row() {
+        let mut app = App::new(
+            std::env::temp_dir(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.cwd = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        app.refresh_entries();
+        assert!(
+            !app.entries.iter().any(|e| e.is_parent),
+            "the root has no parent to offer"
+        );
     }
 
     #[test]

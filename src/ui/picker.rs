@@ -89,12 +89,26 @@ pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
 fn row_line(row: &DirEntryRow, width: usize) -> Line<'static> {
     if row.is_parent {
         return Line::from(vec![
-            Span::styled("⬆ ", Style::default().fg(DIM)),
+            Span::styled("^ ", Style::default().fg(DIM)),
             Span::styled("..", Style::default().fg(DIM)),
             Span::styled(
                 "   (s scans the current directory)",
                 Style::default().fg(DIM),
             ),
+        ]);
+    }
+
+    // A drive root is a jump to another disk rather than a step down the tree,
+    // so it is labelled instead of looking like an ordinary subdirectory.
+    if row.is_drive {
+        let suffix = " (drive)";
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format::truncate(&row.name, width.saturating_sub(2 + suffix.len())),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(suffix, Style::default().fg(DIM)),
         ]);
     }
 
@@ -132,10 +146,15 @@ fn contents_title(app: &App) -> String {
     let dirs = app
         .entries
         .iter()
-        .filter(|r| r.is_dir && !r.is_parent)
+        .filter(|r| r.is_dir && !r.is_parent && !r.is_drive)
         .count();
     let files = app.entries.iter().filter(|r| !r.is_dir).count();
-    format!(" {dirs} directories · {files} files ")
+    let drives = app.entries.iter().filter(|r| r.is_drive).count();
+    if drives > 0 {
+        format!(" {drives} drives · {dirs} directories · {files} files ")
+    } else {
+        format!(" {dirs} directories · {files} files ")
+    }
 }
 
 /// `name:on` / `name:off`, coloured so the active filter set is readable.

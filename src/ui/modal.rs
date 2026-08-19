@@ -77,7 +77,7 @@ pub fn draw_confirm(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "y / ⏎",
+                "y / Enter",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  confirm     ", Style::default().fg(DIM)),

@@ -78,11 +78,15 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
         Screen::Picker => {
             let mut keys = owned(vec![
                 ("\u{2191}\u{2193}", "navigate"),
-                ("\u{23ce}", "open"),
-                ("\u{232b}", "up"),
+                ("Enter", "open"),
+                ("Bksp", "up"),
                 ("~", "home"),
                 (".", "hidden dirs"),
                 ("1-4", "filters"),
+                #[cfg(windows)]
+                ("d", "drives"),
+                #[cfg(not(windows))]
+                ("d", "root"),
             ]);
             keys.push(("s".to_string(), format!("SCAN {}", app.scan_target_label())));
             keys.push(("q".to_string(), "quit".to_string()));
@@ -92,9 +96,9 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
         Screen::Deleting => owned(vec![("Esc", "stop after current file")]),
         Screen::Results | Screen::Confirm => {
             let mut keys: Vec<(&'static str, &'static str)> = vec![
-                ("\u{21b9}", "pane"),
+                ("Tab", "pane"),
                 ("\u{2191}\u{2193}", "move"),
-                ("\u{2423}", "keep this"),
+                ("Space", "keep this"),
                 ("d", "toggle"),
                 ("x", "skip group"),
                 ("1", "first"),
@@ -113,7 +117,7 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
             owned(keys)
         }
         Screen::Done => owned(vec![
-            ("\u{23ce}", "back to results"),
+            ("Enter", "back to results"),
             ("r", "rescan"),
             ("\u{2191}\u{2193}", "failures"),
             ("q", "quit"),
@@ -524,6 +528,38 @@ mod tests {
 
     /// The footer must name the directory `s` would scan, so the target is never
     /// ambiguous while navigating.
+    /// Footer key labels must not use glyphs whose rendered width disagrees
+    /// with unicode-width. U+232B and U+2B06 in particular measure as one cell
+    /// but most fonts draw them two cells wide, which swallows the space after
+    /// them and produces output like "Bkspup". Plain ASCII cannot misalign; the
+    /// bare arrows are allowed because they render narrow in practice.
+    #[test]
+    fn footer_key_labels_avoid_ambiguous_width_glyphs() {
+        const ALLOWED_NON_ASCII: &[char] = &['\u{2191}', '\u{2193}'];
+
+        for screen in [
+            Screen::Picker,
+            Screen::Scanning,
+            Screen::Results,
+            Screen::Confirm,
+            Screen::Deleting,
+            Screen::Done,
+        ] {
+            let mut app = app_with_results();
+            app.screen = screen;
+            for (key, desc) in footer_keys(&app) {
+                for c in key.chars().chain(desc.chars()) {
+                    assert!(
+                        c.is_ascii() || ALLOWED_NON_ASCII.contains(&c),
+                        "{screen:?}: key label {key:?}/{desc:?} uses U+{:04X}, whose \
+                         rendered width is unreliable",
+                        c as u32
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_picker_footer_names_the_scan_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -566,6 +602,39 @@ mod tests {
         assert!(
             text.contains("1 directories") && text.contains("1 files"),
             "the title should count both:\n{text}"
+        );
+    }
+
+    /// Drive rows must be visually distinct from subdirectories, since entering
+    /// one moves to another disk rather than descending the current tree.
+    #[test]
+    fn drive_rows_render_as_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.screen = Screen::Picker;
+        app.entries = crate::app::App::drive_rows(
+            &[
+                std::path::PathBuf::from("C:\\"),
+                std::path::PathBuf::from("D:\\"),
+            ],
+            std::path::Path::new("C:\\"),
+        );
+        let text = rendered_text(&mut app, 100, 20);
+        assert!(
+            text.contains("D:"),
+            "the other drive should be listed:\n{text}"
+        );
+        assert!(
+            text.contains("(drive)"),
+            "a drive should be labelled as one:\n{text}"
+        );
+        assert!(
+            text.contains("1 drives"),
+            "the title should count drives:\n{text}"
         );
     }
 

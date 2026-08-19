@@ -62,8 +62,13 @@ shows their current state.
 
 ## Keys
 
-**Browser** — `↑↓` navigate · `⏎` open · `⌫` up · `~` home · `.` show hidden
-directories · `1`–`4` filters · `s` scan the highlighted directory · `q` quit
+**Browser** — `↑↓` navigate · `Enter` open · `Bksp` up · `~` home · `d` drives
+(Windows) / filesystem root · `.` show hidden directories · `1`–`4` filters ·
+`s` scan the highlighted directory · `q` quit
+
+On Windows there is nothing above `C:\`, so the other drives are listed in place
+of the `..` row once you reach the top of a drive. `d` jumps straight there, so
+switching from `C:` to `D:` is `d` then `Enter` on the drive you want.
 
 `s` scans whatever directory is highlighted, so you do not have to navigate into
 it first. The footer always names the target — `s SCAN photos` — so it is never
@@ -77,7 +82,7 @@ nothing on a file and `s` falls back to scanning the containing directory. The
 
 **Scanning** — `Esc` cancel
 
-**Dashboard** — `↹` switch pane · `↑↓` move · `␣` keep the highlighted copy ·
+**Dashboard** — `Tab` switch pane · `↑↓` move · `Space` keep the highlighted copy ·
 `d` toggle one mark · `x` skip the whole group · `s` cycle sort ·
 `t` Trash / permanent · `D` delete the marked copies · `r` rescan · `q` quit
 
@@ -192,7 +197,7 @@ supported Rust version so `rust-version` in `Cargo.toml` cannot drift.
 cargo test
 ```
 
-103 tests covering the scanner against fixture trees with known answers
+112 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.
