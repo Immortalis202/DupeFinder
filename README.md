@@ -139,6 +139,19 @@ the thread pool is not oversubscribed.
   not what you want.
 - Paths are never assumed to be UTF-8; display is lossy rather than fatal.
 
+## Releases
+
+Pushing a `v*` tag builds Linux and Windows binaries and publishes them to a
+GitHub release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The tag must match the `version` in `Cargo.toml` — the workflow fails fast if it
+does not. `.github/workflows/ci.yml` runs formatting, clippy and the tests on
+both Linux and Windows for every push and pull request.
+
 ## Tests
 
 ```sh

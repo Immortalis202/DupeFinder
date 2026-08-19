@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      # Clippy runs on BOTH platforms deliberately: the cfg(windows)
+      # reparse-point skipping and the Recycle Bin code are never compiled on
+      # Linux, so a Linux-only lint pass cannot see them.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  msrv:
+    name: minimum supported Rust (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Verifies the rust-version in Cargo.toml is not an empty claim.
+      - run: cargo check --locked --all-targets
