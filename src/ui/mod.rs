@@ -672,7 +672,11 @@ mod tests {
             DeleteMode::Trash,
         );
         app.screen = Screen::Picker;
-        app.picker_selected = 1; // the "holidays" row
+        app.picker_selected = app
+            .entries
+            .iter()
+            .position(|r| r.name == "holidays")
+            .expect("the directory should be listed");
 
         let text = rendered_text(&mut app, 100, 20);
         assert!(
@@ -683,6 +687,31 @@ mod tests {
 
     /// Files are listed for context, with their size, so you can see what you
     /// are about to point the scanner at.
+    /// The counts describe the directory's contents, so the navigation rows the
+    /// browser adds must not inflate them.
+    #[test]
+    fn the_title_counts_contents_not_navigation_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("one")).unwrap();
+        std::fs::create_dir(dir.path().join("two")).unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.screen = Screen::Picker;
+        let text = rendered_text(&mut app, 100, 20);
+
+        // Four rows are listed -- action, .., two dirs, one file -- but only the
+        // two directories and one file are contents.
+        assert!(
+            text.contains("2 directories") && text.contains("1 files"),
+            "counts must exclude the action and parent rows:\n{text}"
+        );
+    }
+
     #[test]
     fn the_picker_lists_files_with_their_sizes() {
         let dir = tempfile::tempdir().unwrap();
@@ -739,19 +768,35 @@ mod tests {
         );
     }
 
+    /// Scanning the directory you are in has to be visible in the list, not
+    /// just reachable: at a drive root there is no `..` to fall back on.
     #[test]
-    fn the_parent_row_explains_what_s_does_there() {
+    fn the_first_row_offers_to_scan_the_current_directory() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
         let mut app = App::new(
             dir.path().to_path_buf(),
             ScanOptions::default(),
             DeleteMode::Trash,
         );
         app.screen = Screen::Picker;
+
+        assert_eq!(app.picker_selected, 0, "it starts highlighted");
         let text = rendered_text(&mut app, 100, 20);
         assert!(
-            text.contains("current directory"),
-            "the .. row should say that s scans where you are:\n{text}"
+            text.contains("scan all of"),
+            "the action row must say what it does:\n{text}"
+        );
+        // And it names the directory, not a bare "." that means nothing on
+        // Windows.
+        let leaf = dir
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .expect("tempdir has a name");
+        assert!(
+            text.contains(&leaf),
+            "the action row should name the directory ({leaf}):\n{text}"
         );
     }
 

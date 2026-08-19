@@ -66,9 +66,23 @@ shows their current state.
 (Windows) / filesystem root · `.` show hidden directories · `1`–`4` filters ·
 `s` scan the highlighted directory · `q` quit
 
-On Windows there is nothing above `C:\`, so the other drives are listed in place
-of the `..` row once you reach the top of a drive. `d` jumps straight there, so
-switching from `C:` to `D:` is `d` then `Enter` on the drive you want.
+The first row of every listing is `[ scan all of <path> ]`, and it starts
+highlighted — so pressing `s` on entry scans the directory you are in. It is
+always there, which matters at a drive root: nothing sits above `C:\`, so there is
+no `..` row to fall back on, and without it a drive holding no loose files could
+not be scanned at all.
+
+Every other row scans what it denotes: `..` scans the parent, a drive row scans
+that drive, a directory row scans that directory. A file is not scannable, so `s`
+there scans the directory holding it. The footer always names the target.
+
+The other drives are listed in place of the `..` row once you reach the top of a
+drive, so switching from `C:` to `D:` is `d` then `Enter` on the drive you want.
+
+Only directories and files you would care about are listed: on Windows the
+browser honours the hidden attribute as well as the dotfile convention, so a
+drive root does not bury its contents under `$Recycle.Bin`,
+`System Volume Information`, `pagefile.sys` and `hiberfil.sys`. `.` reveals them.
 
 `s` scans whatever directory is highlighted, so you do not have to navigate into
 it first. The footer always names the target — `s SCAN photos` — so it is never
@@ -244,7 +258,7 @@ a real folder cannot wipe it.
 cargo test
 ```
 
-145 tests covering the scanner against fixture trees with known answers
+151 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.

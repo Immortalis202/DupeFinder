@@ -43,19 +43,44 @@ pub enum DeletePlan {
     Single { group: usize, file: usize },
 }
 
+/// What a browser row stands for.
+///
+/// An enum rather than a set of booleans: the kinds are mutually exclusive, and
+/// with flags a combination like parent-and-drive would be representable. It
+/// also forces `scan_target` to handle every kind explicitly, which is the point
+/// -- a catch-all arm there was what made a drive root unscannable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// The directory being listed. Always offered, so "scan where I am" is
+    /// reachable even at a drive root, where there is no parent.
+    Current,
+    /// `..`
+    Parent,
+    /// A sibling drive root such as `D:\`. Windows only.
+    Drive,
+    Directory,
+    /// Listed for context; a file is not a scan target.
+    File,
+}
+
 /// One row in the directory browser.
 #[derive(Debug, Clone)]
 pub struct DirEntryRow {
     pub name: String,
     pub path: PathBuf,
-    pub is_parent: bool,
-    /// Files are listed for context but are not scan targets: you scan a tree.
-    pub is_dir: bool,
-    /// Size in bytes, for files only.
+    pub kind: RowKind,
+    /// Size in bytes, for `RowKind::File` only.
     pub size: Option<u64>,
-    /// A Windows drive root such as `D:\`, offered so the user can move
-    /// between disks. Never set on Unix, which has a single root.
-    pub is_drive: bool,
+}
+
+impl DirEntryRow {
+    /// True for anything the user can descend into with Enter.
+    pub fn is_navigable(&self) -> bool {
+        matches!(
+            self.kind,
+            RowKind::Parent | RowKind::Drive | RowKind::Directory
+        )
+    }
 }
 
 /// Everything the UI draws and the keys mutate.
@@ -161,10 +186,8 @@ impl App {
             .map(|d| DirEntryRow {
                 name: d.to_string_lossy().into_owned(),
                 path: d.clone(),
-                is_parent: false,
-                is_dir: true,
+                kind: RowKind::Drive,
                 size: None,
-                is_drive: true,
             })
             .collect()
     }
@@ -175,14 +198,22 @@ impl App {
         self.entries.clear();
         self.picker_error = None;
 
+        // Always first, so "scan the directory I am in" is reachable from any
+        // listing. Without it, a drive root holding no files offers no row that
+        // denotes the drive, and the whole drive cannot be scanned.
+        self.entries.push(DirEntryRow {
+            name: self.cwd.to_string_lossy().into_owned(),
+            path: self.cwd.clone(),
+            kind: RowKind::Current,
+            size: None,
+        });
+
         if let Some(parent) = self.cwd.parent() {
             self.entries.push(DirEntryRow {
                 name: "..".to_string(),
                 path: parent.to_path_buf(),
-                is_parent: true,
-                is_dir: true,
+                kind: RowKind::Parent,
                 size: None,
-                is_drive: false,
             });
         } else {
             // Top of this drive: `..` leads nowhere, so the sibling drives take
@@ -197,7 +228,7 @@ impl App {
                 let mut files: Vec<DirEntryRow> = Vec::new();
                 for entry in reader.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if !self.show_hidden_in_picker && name.starts_with('.') {
+                    if !self.show_hidden_in_picker && is_hidden(&name, &entry) {
                         continue;
                     }
                     let file_type = entry.file_type().ok();
@@ -205,8 +236,11 @@ impl App {
                     let row = DirEntryRow {
                         name,
                         path: entry.path(),
-                        is_parent: false,
-                        is_dir,
+                        kind: if is_dir {
+                            RowKind::Directory
+                        } else {
+                            RowKind::File
+                        },
                         // Only files show a size; a directory's own size is
                         // meaningless here and stat-ing the tree would be slow.
                         size: if is_dir {
@@ -214,7 +248,6 @@ impl App {
                         } else {
                             entry.metadata().ok().map(|m| m.len())
                         },
-                        is_drive: false,
                     };
                     if is_dir {
                         dirs.push(row);
@@ -241,9 +274,16 @@ impl App {
     /// directory when the highlight is on the parent row, on a file, or nowhere.
     /// A file is never a scan target -- dupefind scans trees.
     pub fn scan_target(&self) -> PathBuf {
-        match self.entries.get(self.picker_selected) {
-            Some(row) if row.is_dir && !row.is_parent => row.path.clone(),
-            _ => self.cwd.clone(),
+        let Some(row) = self.entries.get(self.picker_selected) else {
+            return self.cwd.clone();
+        };
+        // Exhaustive on purpose. The previous catch-all arm is what made a drive
+        // root unscannable: only `..` and file rows reached it, and at a drive
+        // root neither need exist.
+        match row.kind {
+            // A file cannot be scanned; the directory holding it is the target.
+            RowKind::Current | RowKind::File => self.cwd.clone(),
+            RowKind::Parent | RowKind::Drive | RowKind::Directory => row.path.clone(),
         }
     }
 
@@ -258,8 +298,9 @@ impl App {
 
     fn enter_selected_dir(&mut self) {
         match self.entries.get(self.picker_selected) {
-            // Files are shown for context only; there is nothing to open.
-            Some(row) if row.is_dir => {
+            // Files are context only, and the current-directory row is where we
+            // already are: neither is something to descend into.
+            Some(row) if row.is_navigable() => {
                 self.cwd = row.path.clone();
                 self.picker_selected = 0;
                 self.refresh_entries();
@@ -667,7 +708,7 @@ impl App {
                 if self
                     .entries
                     .get(self.picker_selected)
-                    .is_some_and(|r| r.is_parent)
+                    .is_some_and(|r| r.kind == RowKind::Parent)
                 {
                     self.go_to_parent();
                 } else {
@@ -945,6 +986,47 @@ impl App {
     }
 }
 
+/// Whether the browser should hide this entry.
+///
+/// The dotfile convention covers Unix. On Windows it misses the hidden
+/// attribute, which is how a drive root ends up listing `$Recycle.Bin`,
+/// `System Volume Information`, `pagefile.sys` and `hiberfil.sys`.
+fn is_hidden(name: &str, entry: &std::fs::DirEntry) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    hidden_by_attribute(entry)
+}
+
+/// Only `HIDDEN`, not `SYSTEM`: everything a drive root clutters the list with is
+/// hidden, and testing `SYSTEM` too would suppress directories a user may want.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+/// Split out from the metadata lookup so the bit test is unit-testable on any
+/// platform, not only where the attribute exists.
+#[cfg(windows)]
+pub fn attrs_are_hidden(attrs: u32) -> bool {
+    attrs & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+#[cfg(windows)]
+fn hidden_by_attribute(entry: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // Windows fills this in from the directory scan, so it costs no extra I/O.
+    entry
+        .metadata()
+        .map(|m| attrs_are_hidden(m.file_attributes()))
+        .unwrap_or(false)
+}
+
+/// Unix has no hidden attribute; the dotfile rule is the whole convention, so
+/// this avoids a per-entry `stat` that would buy nothing.
+#[cfg(not(windows))]
+fn hidden_by_attribute(_entry: &std::fs::DirEntry) -> bool {
+    false
+}
+
 /// Drive roots the user can switch to.
 ///
 /// Windows has no parent above `C:\`, so drives have to be enumerated to let
@@ -1029,6 +1111,25 @@ mod tests {
         app.sort = SortKey::Wasted;
         app.sort_groups();
         app
+    }
+
+    /// Index of the row with this name, so picker tests never hard-code a
+    /// position. A wrong index would assert against the wrong row in silence.
+    fn row(app: &App, name: &str) -> usize {
+        app.entries
+            .iter()
+            .position(|r| r.name == name)
+            .unwrap_or_else(|| panic!("no row named {name:?}"))
+    }
+
+    /// The names of the rows that are directory contents, skipping the
+    /// current-directory, parent and drive rows, which are navigation.
+    fn content_names(app: &App) -> Vec<&str> {
+        app.entries
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Directory | RowKind::File))
+            .map(|r| r.name.as_str())
+            .collect()
     }
 
     /// `n` groups of two copies each, with distinct hashes and descending sizes
@@ -1889,11 +1990,19 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
-            names,
-            vec!["..", "alpha", "beta", "a-file.txt"],
-            "parent first, then directories, then files -- each group sorted"
+            content_names(&app),
+            vec!["alpha", "beta", "a-file.txt"],
+            "directories before files, each group sorted"
+        );
+        // Navigation rows lead the list: the scan-this-directory row, then `..`.
+        assert_eq!(
+            app.entries
+                .iter()
+                .map(|r| r.kind)
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec![RowKind::Current, RowKind::Parent]
         );
     }
 
@@ -1913,11 +2022,11 @@ mod tests {
             .iter()
             .find(|e| e.name == "data.bin")
             .expect("the file should be listed");
-        assert!(!file.is_dir);
+        assert_eq!(file.kind, RowKind::File);
         assert_eq!(file.size, Some(4096));
 
         let sub = app.entries.iter().find(|e| e.name == "sub").unwrap();
-        assert!(sub.is_dir);
+        assert_eq!(sub.kind, RowKind::Directory);
         assert_eq!(sub.size, None, "directories carry no size");
     }
 
@@ -1933,8 +2042,7 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["..", "zzz", "aaa.txt"]);
+        assert_eq!(content_names(&app), vec!["zzz", "aaa.txt"]);
     }
 
     #[test]
@@ -2024,8 +2132,7 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        // Row 0 is "..", row 1 is "child".
-        app.picker_selected = 1;
+        app.picker_selected = row(&app, "child");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.cwd, child);
 
@@ -2048,8 +2155,7 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        // Rows: 0 = "..", 1 = alpha, 2 = beta.
-        app.picker_selected = 2;
+        app.picker_selected = row(&app, "beta");
         assert_eq!(app.scan_target(), beta);
         assert_eq!(app.scan_target_label(), "beta");
 
@@ -2105,9 +2211,10 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        press(&mut app, KeyCode::Down); // -> "one"
+        // Rows: scan-this-directory, "..", then the two subdirectories.
+        app.picker_selected = row(&app, "one");
         assert_eq!(app.scan_target_label(), "one");
-        press(&mut app, KeyCode::Down); // -> "two"
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.scan_target_label(), "two");
         press(&mut app, KeyCode::Up);
         assert_eq!(app.scan_target_label(), "one");
@@ -2129,7 +2236,8 @@ mod tests {
             vec!["D:\\", "E:\\"],
             "the current drive is not offered"
         );
-        assert!(rows.iter().all(|r| r.is_drive && r.is_dir && !r.is_parent));
+        assert!(rows.iter().all(|r| r.kind == RowKind::Drive));
+        assert!(rows.iter().all(|r| r.is_navigable()));
     }
 
     #[test]
@@ -2182,6 +2290,30 @@ mod tests {
         assert_eq!(app.picker_selected, 0);
     }
 
+    /// The Windows attribute lookup cannot run here, but the bit test can, so
+    /// the predicate itself is covered rather than left to CI compilation alone.
+    #[cfg(windows)]
+    #[test]
+    fn hidden_attribute_bits_are_read_correctly() {
+        const NORMAL: u32 = 0x80;
+        const HIDDEN: u32 = 0x2;
+        const SYSTEM: u32 = 0x4;
+        const DIRECTORY: u32 = 0x10;
+
+        assert!(attrs_are_hidden(HIDDEN), "a hidden file is hidden");
+        assert!(
+            attrs_are_hidden(HIDDEN | SYSTEM | DIRECTORY),
+            "$Recycle.Bin and System Volume Information are hidden+system dirs"
+        );
+        assert!(!attrs_are_hidden(NORMAL), "an ordinary file is not hidden");
+        assert!(
+            !attrs_are_hidden(SYSTEM | DIRECTORY),
+            "system-only is deliberately NOT hidden: that would suppress \
+             directories a user may want"
+        );
+        assert!(!attrs_are_hidden(0), "no attributes means not hidden");
+    }
+
     #[test]
     fn available_drives_is_empty_on_unix() {
         #[cfg(not(windows))]
@@ -2207,9 +2339,172 @@ mod tests {
         assert!(app.cwd.parent().is_none(), "precondition: {:?}", app.cwd);
         app.refresh_entries();
         assert!(
-            !app.entries.iter().any(|e| e.is_parent),
+            !app.entries.iter().any(|e| e.kind == RowKind::Parent),
             "the root has no parent to offer"
         );
+        // But it must still offer itself, or the drive is unscannable.
+        assert_eq!(app.entries.first().map(|e| e.kind), Some(RowKind::Current));
+    }
+
+    // ------------------------------------------- scanning where you already are
+
+    /// The reported bug: at a drive root there is no `..`, so if the directory
+    /// holds no files nothing denoted the drive and it could not be scanned.
+    /// Built by hand because a parentless directory only exists at `/` on Linux,
+    /// which does contain files.
+    #[test]
+    fn a_parentless_directory_with_no_files_is_still_scannable() {
+        let mut app = App::new(
+            std::env::temp_dir(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        let drive = PathBuf::from("C:\\");
+        app.cwd = drive.clone();
+        // Exactly what a bare Windows drive root looks like: no parent row, no
+        // files, only subdirectories.
+        app.entries = vec![
+            DirEntryRow {
+                name: drive.to_string_lossy().into_owned(),
+                path: drive.clone(),
+                kind: RowKind::Current,
+                size: None,
+            },
+            DirEntryRow {
+                name: "Windows".into(),
+                path: drive.join("Windows"),
+                kind: RowKind::Directory,
+                size: None,
+            },
+        ];
+
+        assert!(
+            !app.entries.iter().any(|r| r.kind == RowKind::Parent),
+            "precondition: a drive root has no parent row"
+        );
+        assert!(
+            !app.entries.iter().any(|r| r.kind == RowKind::File),
+            "precondition: no file row to fall back on"
+        );
+
+        app.picker_selected = 0;
+        assert_eq!(
+            app.scan_target(),
+            drive,
+            "the first row must target the drive itself"
+        );
+    }
+
+    /// Every kind spelled out, so the match cannot quietly regress into a
+    /// catch-all -- which is what caused the bug above.
+    #[test]
+    fn scan_target_is_defined_for_every_row_kind() {
+        let mut app = App::new(
+            std::env::temp_dir(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        let cwd = PathBuf::from("/scan/here");
+        let parent = PathBuf::from("/scan");
+        app.cwd = cwd.clone();
+        app.entries = vec![
+            DirEntryRow {
+                name: "cur".into(),
+                path: cwd.clone(),
+                kind: RowKind::Current,
+                size: None,
+            },
+            DirEntryRow {
+                name: "..".into(),
+                path: parent.clone(),
+                kind: RowKind::Parent,
+                size: None,
+            },
+            DirEntryRow {
+                name: "D:\\".into(),
+                path: PathBuf::from("D:\\"),
+                kind: RowKind::Drive,
+                size: None,
+            },
+            DirEntryRow {
+                name: "sub".into(),
+                path: cwd.join("sub"),
+                kind: RowKind::Directory,
+                size: None,
+            },
+            DirEntryRow {
+                name: "f.bin".into(),
+                path: cwd.join("f.bin"),
+                kind: RowKind::File,
+                size: Some(1),
+            },
+        ];
+
+        let expected = [
+            (RowKind::Current, cwd.clone()),
+            // The parent row denotes the parent, so that is what it scans.
+            (RowKind::Parent, parent),
+            (RowKind::Drive, PathBuf::from("D:\\")),
+            (RowKind::Directory, cwd.join("sub")),
+            // A file cannot be scanned; its containing directory is the target.
+            (RowKind::File, cwd.clone()),
+        ];
+        for (idx, (kind, want)) in expected.iter().enumerate() {
+            app.picker_selected = idx;
+            assert_eq!(app.scan_target(), *want, "for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_action_row_is_first_in_every_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        assert_eq!(app.entries.first().map(|r| r.kind), Some(RowKind::Current));
+        assert_eq!(app.picker_selected, 0, "and starts highlighted");
+        assert_eq!(app.scan_target(), dir.path());
+
+        // Still first after descending.
+        app.picker_selected = row(&app, "sub");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.entries.first().map(|r| r.kind), Some(RowKind::Current));
+        assert_eq!(app.scan_target(), dir.path().join("sub"));
+    }
+
+    #[test]
+    fn enter_on_the_action_row_goes_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.picker_selected = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.cwd, dir.path(), "there is nothing to descend into");
+        assert_eq!(app.screen, Screen::Picker);
+    }
+
+    #[test]
+    fn s_on_the_action_row_scans_the_current_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.picker_selected = 0;
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.screen, Screen::Scanning);
+        assert_eq!(app.scan_root.as_deref(), Some(dir.path()));
     }
 
     #[test]
@@ -2238,7 +2533,7 @@ mod tests {
         app.refresh_entries();
         assert!(app.picker_error.is_some());
         // The parent row is still offered so the user is not stranded.
-        assert!(app.entries.iter().any(|e| e.is_parent));
+        assert!(app.entries.iter().any(|e| e.kind == RowKind::Parent));
     }
 
     #[test]

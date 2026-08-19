@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::{ACCENT, DELETE, DIM, KEEP, header_block, stat, stat_line};
-use crate::app::{App, DirEntryRow};
+use crate::app::{App, DirEntryRow, RowKind};
 use crate::format;
 
 pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
@@ -87,69 +87,80 @@ pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
 /// Directories are the actionable rows and keep full contrast; files are listed
 /// for context only, so they are dimmed and carry their size on the right.
 fn row_line(row: &DirEntryRow, width: usize) -> Line<'static> {
-    if row.is_parent {
-        return Line::from(vec![
+    match row.kind {
+        // The primary action, so it is the brightest row and states the path in
+        // full rather than relying on a convention like "." that means nothing
+        // on Windows.
+        RowKind::Current => {
+            let open = "[ scan all of ";
+            let close = " ]";
+            let budget = width.saturating_sub(open.chars().count() + close.chars().count());
+            Line::from(vec![
+                Span::styled(open, Style::default().fg(KEEP)),
+                Span::styled(
+                    format::truncate_path(&row.name, budget),
+                    Style::default().fg(KEEP).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(close, Style::default().fg(KEEP)),
+            ])
+        }
+
+        RowKind::Parent => Line::from(vec![
             Span::styled("^ ", Style::default().fg(DIM)),
             Span::styled("..", Style::default().fg(DIM)),
-            Span::styled(
-                "   (s scans the current directory)",
-                Style::default().fg(DIM),
-            ),
-        ]);
-    }
+        ]),
 
-    // A drive root is a jump to another disk rather than a step down the tree,
-    // so it is labelled instead of looking like an ordinary subdirectory.
-    if row.is_drive {
-        let suffix = " (drive)";
-        return Line::from(vec![
-            Span::styled("> ", Style::default().fg(ACCENT)),
-            Span::styled(
-                format::truncate(&row.name, width.saturating_sub(2 + suffix.len())),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(suffix, Style::default().fg(DIM)),
-        ]);
-    }
+        // A jump to another disk rather than a step down the tree, so it is
+        // labelled instead of looking like an ordinary subdirectory.
+        RowKind::Drive => {
+            let suffix = " (drive)";
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format::truncate(&row.name, width.saturating_sub(2 + suffix.len())),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(suffix, Style::default().fg(DIM)),
+            ])
+        }
 
-    if row.is_dir {
-        return Line::from(vec![
+        RowKind::Directory => Line::from(vec![
             Span::styled("▸ ", Style::default().fg(ACCENT)),
             Span::styled(
                 format::truncate(&row.name, width.saturating_sub(2)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-        ]);
+        ]),
+
+        // Context only: dimmed, with the size pushed to the right margin.
+        RowKind::File => {
+            let size = row
+                .size
+                .map(format::bytes)
+                .unwrap_or_else(|| "—".to_string());
+            let size_len = size.chars().count();
+            // 2 for the indent, 1 for at least one space before the size.
+            let name = format::truncate(&row.name, width.saturating_sub(size_len + 3));
+            let pad = width
+                .saturating_sub(2 + name.chars().count() + size_len)
+                .max(1);
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(name, Style::default().fg(DIM)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(size, Style::default().fg(DIM)),
+            ])
+        }
     }
-
-    let size = row
-        .size
-        .map(format::bytes)
-        .unwrap_or_else(|| "—".to_string());
-    let size_len = size.chars().count();
-    // 2 for the indent, 1 for at least one space before the size.
-    let name = format::truncate(&row.name, width.saturating_sub(size_len + 3));
-    let pad = width
-        .saturating_sub(2 + name.chars().count() + size_len)
-        .max(1);
-
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(name, Style::default().fg(DIM)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(size, Style::default().fg(DIM)),
-    ])
 }
 
-/// `4 directories · 11 files`, excluding the parent row.
+/// `4 directories · 11 files`, counting only the contents -- not the parent,
+/// drive or current-directory rows, which are navigation rather than content.
 fn contents_title(app: &App) -> String {
-    let dirs = app
-        .entries
-        .iter()
-        .filter(|r| r.is_dir && !r.is_parent && !r.is_drive)
-        .count();
-    let files = app.entries.iter().filter(|r| !r.is_dir).count();
-    let drives = app.entries.iter().filter(|r| r.is_drive).count();
+    let count = |kind: RowKind| app.entries.iter().filter(|r| r.kind == kind).count();
+    let dirs = count(RowKind::Directory);
+    let files = count(RowKind::File);
+    let drives = count(RowKind::Drive);
     if drives > 0 {
         format!(" {drives} drives · {dirs} directories · {files} files ")
     } else {
