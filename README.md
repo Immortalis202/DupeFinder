@@ -27,7 +27,7 @@ byte matches.
 
 ## Building
 
-Requires Rust 1.86 or newer.
+Requires Rust 1.88 or newer.
 
 ```sh
 cargo build --release          # ./target/release/dupefind
