@@ -1435,9 +1435,17 @@ mod tests {
 
         let mut app = App::new(nested.clone(), ScanOptions::default(), DeleteMode::Trash);
         press(&mut app, KeyCode::Char('d'));
-        // On Unix the top is `/`; on Windows it would be the drive root, which
-        // is where the drive rows are listed.
-        assert_eq!(app.cwd, PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+        // The top of a tree is `/` on Unix but a drive root such as `C:\` on
+        // Windows, so assert the property rather than a literal separator.
+        assert!(
+            app.cwd.parent().is_none(),
+            "d should land on a root, got {:?}",
+            app.cwd
+        );
+        assert!(
+            nested.starts_with(&app.cwd),
+            "the root should be an ancestor of where we started"
+        );
         assert_eq!(app.picker_selected, 0);
     }
 
@@ -1457,7 +1465,13 @@ mod tests {
             ScanOptions::default(),
             DeleteMode::Trash,
         );
-        app.cwd = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        // Derive a genuine root: `/` on Unix, the drive root on Windows.
+        app.cwd = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("every path has a topmost ancestor")
+            .to_path_buf();
+        assert!(app.cwd.parent().is_none(), "precondition: {:?}", app.cwd);
         app.refresh_entries();
         assert!(
             !app.entries.iter().any(|e| e.is_parent),
