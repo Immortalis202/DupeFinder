@@ -1,12 +1,12 @@
 //! Overlays: the deletion confirmation and the final report.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
-use super::{centered, header_block, stat, stat_line, ACCENT, DELETE, DIM, KEEP, WARN};
+use super::{ACCENT, DELETE, DIM, KEEP, WARN, centered, header_block, stat, stat_line};
 use crate::app::App;
 use crate::delete::DeleteMode;
 use crate::format;

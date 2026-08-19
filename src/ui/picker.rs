@@ -1,12 +1,12 @@
 //! Directory browser: choose the tree to scan.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
-use super::{header_block, stat, stat_line, ACCENT, DELETE, DIM, KEEP};
+use super::{ACCENT, DELETE, DIM, KEEP, header_block, stat, stat_line};
 use crate::app::{App, DirEntryRow};
 use crate::format;
 

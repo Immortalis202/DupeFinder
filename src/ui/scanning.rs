@@ -1,12 +1,12 @@
 //! Live progress: the scan screen and the deletion screen.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
-use ratatui::Frame;
 
-use super::{header_block, stat, stat_line, ACCENT, DELETE, DIM, KEEP, WARN};
+use super::{ACCENT, DELETE, DIM, KEEP, WARN, header_block, stat, stat_line};
 use crate::app::App;
 use crate::format;
 use crate::model::ScanState;

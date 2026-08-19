@@ -90,6 +90,12 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      # Never publish from a tree whose tests fail. CI covers pushes to main,
+      # but this workflow can also be driven by a hand-pushed tag pointing at
+      # any commit, and it does not otherwise depend on CI being green.
+      - name: Tests
+        run: cargo test --locked --release --target ${{ matrix.target }}
+
       - name: Package (Linux)
         if: matrix.archive == 'tar.gz'
         run: |

@@ -3,8 +3,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -311,10 +311,10 @@ impl App {
             }),
         }
 
-        if let Some(hash) = anchor {
-            if let Some(idx) = self.groups.iter().position(|g| g.hash == hash) {
-                self.group_selected = idx;
-            }
+        if let Some(hash) = anchor
+            && let Some(idx) = self.groups.iter().position(|g| g.hash == hash)
+        {
+            self.group_selected = idx;
         }
         self.clamp_selection();
     }

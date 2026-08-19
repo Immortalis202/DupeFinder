@@ -1,8 +1,8 @@
 //! Core data types shared by the scanner, the deleter and the UI.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// One file on disk belonging to a duplicate group.

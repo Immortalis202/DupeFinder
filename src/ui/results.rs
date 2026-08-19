@@ -1,6 +1,7 @@
 //! The dashboard: duplicate groups on the left, every path in the selected
 //! group on the right with its keep/delete mark.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,9 +9,8 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
-use ratatui::Frame;
 
-use super::{header_block, pack_stats, stat, stat_line, ACCENT, DELETE, DIM, KEEP};
+use super::{ACCENT, DELETE, DIM, KEEP, header_block, pack_stats, stat, stat_line};
 use crate::app::{App, Pane};
 use crate::format;
 use crate::model::DupeGroup;

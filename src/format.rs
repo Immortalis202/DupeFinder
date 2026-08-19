@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use humansize::{format_size, BINARY};
+use humansize::{BINARY, format_size};
 
 /// "412.3 MiB"
 pub fn bytes(n: u64) -> String {
@@ -91,14 +91,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// The scan root is already shown in the header, so repeating it on every row
 /// wastes the columns that carry the actual difference between two copies.
 pub fn relative_to(path: &Path, root: Option<&Path>) -> String {
-    if let Some(root) = root {
-        if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy();
-            if rel.is_empty() {
-                return ".".to_string();
-            }
-            return rel.into_owned();
+    if let Some(root) = root
+        && let Ok(rel) = path.strip_prefix(root)
+    {
+        let rel = rel.to_string_lossy();
+        if rel.is_empty() {
+            return ".".to_string();
         }
+        return rel.into_owned();
     }
     path.to_string_lossy().into_owned()
 }
