@@ -106,6 +106,9 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
                 ("3", "oldest"),
                 ("4", "shortest"),
                 ("s", "sort"),
+                ("m", "mark group"),
+                ("Shift+\u{2191}\u{2193}/JK", "block"),
+                ("a", "all"),
             ];
             keys.push(match app.delete_mode {
                 crate::delete::DeleteMode::Trash => ("t", "mode:trash"),
@@ -485,6 +488,62 @@ mod tests {
             text.contains("restored") || text.contains("Recycle"),
             "trash mode should say the files can come back:\n{text}"
         );
+    }
+
+    /// The scope must be legible before D is pressed, and again in the
+    /// confirmation, so a narrowed delete is never mistaken for a full one.
+    #[test]
+    fn the_header_states_the_selection_scope() {
+        let mut app = app_with_results();
+        let text = rendered_text(&mut app, 120, 30);
+        assert!(
+            text.contains("all 2 groups"),
+            "with no selection the scope should say so:\n{text}"
+        );
+
+        app.selected.insert(app.groups[0].hash);
+        let text = rendered_text(&mut app, 120, 30);
+        assert!(
+            text.contains("1 selected"),
+            "a selection must be stated in the header:\n{text}"
+        );
+    }
+
+    #[test]
+    fn selected_groups_carry_a_marker() {
+        let mut app = app_with_results();
+        let before = rendered_text(&mut app, 120, 30);
+        app.selected.insert(app.groups[0].hash);
+        let after = rendered_text(&mut app, 120, 30);
+        assert_ne!(before, after, "selecting a group must change the list");
+        assert!(
+            after.contains("* "),
+            "a selected row needs a visible marker:\n{after}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_says_the_delete_is_narrowed() {
+        let mut app = app_with_results();
+        app.selected.insert(app.groups[0].hash);
+        app.screen = Screen::Confirm;
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("selected group"),
+            "the confirmation must repeat the narrowed scope:\n{text}"
+        );
+    }
+
+    #[test]
+    fn selection_markers_do_not_shift_the_columns() {
+        let mut app = app_with_results();
+        let unselected = render(&mut app, 120, 30);
+        app.selected.insert(app.groups[0].hash);
+        let selected = render(&mut app, 120, 30);
+        // Every row keeps the same width; the marker lives in its own gutter.
+        for (a, b) in unselected.iter().zip(selected.iter()) {
+            assert_eq!(a.chars().count(), b.chars().count());
+        }
     }
 
     #[test]

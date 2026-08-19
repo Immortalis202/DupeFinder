@@ -89,6 +89,13 @@ pub struct App {
     pub sort: SortKey,
     pub status: Option<String>,
     pub plan: DeletePlan,
+    /// Groups the user has picked out, keyed by content hash so the selection
+    /// survives re-sorting. When non-empty it scopes every bulk action.
+    pub selected: HashSet<[u8; 32]>,
+    /// Where a Shift-extension began, and the selection as it was at that
+    /// moment, so shrinking the range deselects again instead of only growing.
+    shift_anchor: Option<usize>,
+    shift_base: HashSet<[u8; 32]>,
 
     // Delete
     pub delete_state: Arc<DeleteState>,
@@ -123,6 +130,9 @@ impl App {
             sort: SortKey::Wasted,
             status: None,
             plan: DeletePlan::Marked,
+            selected: HashSet::new(),
+            shift_anchor: None,
+            shift_base: HashSet::new(),
             delete_state: Arc::new(DeleteState::default()),
             delete_rx: None,
             report: None,
@@ -374,12 +384,29 @@ impl App {
         self.groups.get(self.group_selected)
     }
 
+    /// Bytes the current marks would free **within scope**.
     pub fn total_reclaimable(&self) -> u64 {
-        delete::pending_bytes(&self.groups)
+        self.marked_targets().iter().map(|(_, size)| size).sum()
     }
 
+    /// Files the current marks would remove **within scope**.
     pub fn total_marked(&self) -> usize {
-        delete::pending_count(&self.groups)
+        self.marked_targets().len()
+    }
+
+    /// Every marked copy the selection scope covers.
+    ///
+    /// Scoped rather than delegating to `delete::pending`, so the number in the
+    /// header is exactly what `D` will act on. An unscoped header beside a
+    /// scoped delete would mislead about an irreversible action.
+    fn marked_targets(&self) -> Vec<(PathBuf, u64)> {
+        delete::pending_in(
+            self.groups
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| self.in_scope(*idx))
+                .map(|(_, group)| group),
+        )
     }
 
     /// Number of redundant copies across all groups, ignoring the marks.
@@ -390,11 +417,138 @@ impl App {
             .sum()
     }
 
-    fn apply_strategy_to_all(&mut self, strategy: KeepStrategy) {
-        for group in &mut self.groups {
-            group.apply_strategy(strategy);
+    // ------------------------------------------------------------ selection
+
+    /// Whether the group at `idx` is in scope for a bulk action: the selection
+    /// when there is one, otherwise every group.
+    pub fn in_scope(&self, idx: usize) -> bool {
+        match self.groups.get(idx) {
+            Some(g) => self.selected.is_empty() || self.selected.contains(&g.hash),
+            None => false,
         }
-        self.status = Some(format!("Keeping the {} in every group", strategy.label()));
+    }
+
+    pub fn is_selected(&self, idx: usize) -> bool {
+        self.groups
+            .get(idx)
+            .is_some_and(|g| self.selected.contains(&g.hash))
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Toggle the highlighted group in or out of the selection.
+    fn toggle_selection(&mut self) {
+        self.end_extension();
+        if let Some(group) = self.groups.get(self.group_selected) {
+            let hash = group.hash;
+            if !self.selected.remove(&hash) {
+                self.selected.insert(hash);
+            }
+        }
+    }
+
+    /// Select every group, or clear the selection if everything is already in.
+    fn toggle_select_all(&mut self) {
+        self.end_extension();
+        if self.selected.len() == self.groups.len() && !self.groups.is_empty() {
+            self.selected.clear();
+            self.status = Some("Selection cleared".to_string());
+        } else {
+            self.selected = self.groups.iter().map(|g| g.hash).collect();
+            self.status = Some(format!("Selected all {} groups", self.groups.len()));
+        }
+    }
+
+    /// Move the cursor and select the block between the anchor and the cursor.
+    ///
+    /// The selection is recomputed from the anchor each time rather than only
+    /// added to, so reversing direction shrinks the block as a file manager
+    /// would, instead of leaving stale rows selected.
+    fn extend_selection(&mut self, delta: isize) {
+        if self.groups.is_empty() {
+            return;
+        }
+        if self.shift_anchor.is_none() {
+            self.shift_anchor = Some(self.group_selected);
+            self.shift_base = self.selected.clone();
+        }
+
+        let last = self.groups.len() as isize - 1;
+        let next = (self.group_selected as isize + delta).clamp(0, last) as usize;
+        self.group_selected = next;
+        self.file_selected = 0;
+
+        let anchor = self.shift_anchor.unwrap_or(next).min(self.groups.len() - 1);
+        let (lo, hi) = if anchor <= next {
+            (anchor, next)
+        } else {
+            (next, anchor)
+        };
+
+        self.selected = self.shift_base.clone();
+        for group in &self.groups[lo..=hi] {
+            self.selected.insert(group.hash);
+        }
+    }
+
+    /// Any cursor move or toggle that is not a Shift-extension ends the block.
+    fn end_extension(&mut self) {
+        self.shift_anchor = None;
+        self.shift_base.clear();
+    }
+
+    /// Indices the bulk actions apply to.
+    fn scoped_indices(&self) -> Vec<usize> {
+        (0..self.groups.len())
+            .filter(|i| self.in_scope(*i))
+            .collect()
+    }
+
+    fn apply_strategy_to_all(&mut self, strategy: KeepStrategy) {
+        let scoped = self.scoped_indices();
+        for idx in &scoped {
+            if let Some(group) = self.groups.get_mut(*idx) {
+                group.apply_strategy(strategy);
+            }
+        }
+        self.status = Some(if self.selected.is_empty() {
+            format!("Keeping the {} in every group", strategy.label())
+        } else {
+            format!(
+                "Keeping the {} in {} selected group{}",
+                strategy.label(),
+                scoped.len(),
+                if scoped.len() == 1 { "" } else { "s" }
+            )
+        });
+    }
+
+    /// Skip or unskip every group in scope, moving them all to one state rather
+    /// than flipping each independently.
+    fn toggle_skip_in_scope(&mut self) {
+        if self.selected.is_empty() {
+            if let Some(group) = self.groups.get_mut(self.group_selected) {
+                group.skipped = !group.skipped;
+            }
+            return;
+        }
+        let scoped = self.scoped_indices();
+        let skip = scoped
+            .iter()
+            .any(|i| self.groups.get(*i).is_some_and(|g| !g.skipped));
+        for idx in &scoped {
+            if let Some(group) = self.groups.get_mut(*idx) {
+                group.skipped = skip;
+            }
+        }
+        self.status = Some(format!(
+            "{} {} selected group{}",
+            if skip { "Skipped" } else { "Un-skipped" },
+            scoped.len(),
+            if scoped.len() == 1 { "" } else { "s" }
+        ));
     }
 
     // ---------------------------------------------------------------- delete
@@ -402,7 +556,7 @@ impl App {
     /// The files the current plan would remove.
     pub fn planned_targets(&self) -> Vec<(PathBuf, u64)> {
         match self.plan {
-            DeletePlan::Marked => delete::pending(&self.groups),
+            DeletePlan::Marked => self.marked_targets(),
             DeletePlan::Single { group, file } => self
                 .groups
                 .get(group)
@@ -455,6 +609,10 @@ impl App {
                 }
                 self.clamp_selection();
                 self.plan = DeletePlan::Marked;
+                // Groups have disappeared; a stale selection would silently
+                // scope the next action to whatever survived.
+                self.selected.clear();
+                self.end_extension();
 
                 self.report = Some(report);
                 self.delete_rx = None;
@@ -566,21 +724,57 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
-                self.screen = Screen::Picker;
-                self.refresh_entries();
+                // Clearing a selection is the more likely intent than leaving.
+                if self.selected.is_empty() {
+                    self.screen = Screen::Picker;
+                    self.refresh_entries();
+                } else {
+                    self.selected.clear();
+                    self.end_extension();
+                    self.status = Some("Selection cleared".to_string());
+                }
             }
             KeyCode::Tab | KeyCode::BackTab => {
+                self.end_extension();
                 self.pane = match self.pane {
                     Pane::Groups => Pane::Files,
                     Pane::Files => Pane::Groups,
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
-            KeyCode::Home => self.set_selection(0),
-            KeyCode::End => self.set_selection(usize::MAX),
+            // Shift+arrow extends the block; a bare arrow ends it. K/J are a
+            // fallback because not every terminal reports Shift+arrow.
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_selection(1)
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.extend_selection(-1),
+            KeyCode::Char('J') => self.extend_selection(1),
+            KeyCode::Char('K') => self.extend_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.end_extension();
+                self.move_selection(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.end_extension();
+                self.move_selection(-1)
+            }
+            KeyCode::PageDown => {
+                self.end_extension();
+                self.move_selection(10)
+            }
+            KeyCode::PageUp => {
+                self.end_extension();
+                self.move_selection(-10)
+            }
+            KeyCode::Home => {
+                self.end_extension();
+                self.set_selection(0)
+            }
+            KeyCode::End => {
+                self.end_extension();
+                self.set_selection(usize::MAX)
+            }
+            KeyCode::Char('m') => self.toggle_selection(),
+            KeyCode::Char('a') => self.toggle_select_all(),
             KeyCode::Right | KeyCode::Char('l') => self.pane = Pane::Files,
             KeyCode::Left | KeyCode::Char('h') => self.pane = Pane::Groups,
 
@@ -603,11 +797,7 @@ impl App {
                 }
                 self.pane = Pane::Files;
             }
-            KeyCode::Char('x') => {
-                if let Some(group) = self.groups.get_mut(self.group_selected) {
-                    group.skipped = !group.skipped;
-                }
-            }
+            KeyCode::Char('x') => self.toggle_skip_in_scope(),
             KeyCode::Char('1') => self.apply_strategy_to_all(KeepStrategy::First),
             KeyCode::Char('2') => self.apply_strategy_to_all(KeepStrategy::Newest),
             KeyCode::Char('3') => self.apply_strategy_to_all(KeepStrategy::Oldest),
@@ -837,6 +1027,33 @@ mod tests {
         ];
         app.screen = Screen::Results;
         app.sort = SortKey::Wasted;
+        app.sort_groups();
+        app
+    }
+
+    /// `n` groups of two copies each, with distinct hashes and descending sizes
+    /// so the default sort order is stable and predictable.
+    fn app_with_results_of(n: usize) -> App {
+        let mut app = App::new(
+            std::env::temp_dir(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.scan_root = Some(PathBuf::from("/scan/root"));
+        app.groups = (0..n)
+            .map(|i| {
+                let size = ((n - i) * 1000) as u64;
+                DupeGroup::new(
+                    [i as u8 + 1; 32],
+                    size,
+                    vec![
+                        entry(&format!("/g{i}/a.bin"), size, Some(100)),
+                        entry(&format!("/g{i}/b.bin"), size, Some(200)),
+                    ],
+                )
+            })
+            .collect();
+        app.screen = Screen::Results;
         app.sort_groups();
         app
     }
@@ -1134,7 +1351,7 @@ mod tests {
     fn a_successful_delete_removes_the_entries_from_the_dashboard() {
         let mut app = app_with_results();
         // Everything that was marked actually went.
-        let gone: Vec<PathBuf> = delete::pending(&app.groups)
+        let gone: Vec<PathBuf> = delete::pending_in(app.groups.iter())
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -1196,7 +1413,7 @@ mod tests {
         app.groups[0].skipped = true;
         let before = app.groups[0].files.len();
         // Only the other group's marked copy was deleted.
-        let gone: Vec<PathBuf> = delete::pending(&app.groups)
+        let gone: Vec<PathBuf> = delete::pending_in(app.groups.iter())
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -1373,6 +1590,291 @@ mod tests {
         press(&mut app, KeyCode::Char('D'));
         assert_eq!(app.plan, DeletePlan::Marked);
         assert_eq!(app.planned_targets().len(), app.total_marked());
+    }
+
+    // ------------------------------------------------------ group selection
+
+    /// The selection is keyed by content hash, not row index: sorting reorders
+    /// the list, and an index-keyed set would silently point at other groups.
+    #[test]
+    fn a_selection_survives_re_sorting() {
+        let mut app = app_with_results();
+        app.group_selected = 0;
+        press(&mut app, KeyCode::Char('m'));
+        let picked = app.groups[0].hash;
+        assert!(app.selected.contains(&picked));
+
+        // Cycle through every sort order; the same group stays selected.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.selected.len(), 1, "selection size must not change");
+            assert!(
+                app.selected.contains(&picked),
+                "the same group must stay selected after sorting"
+            );
+            let idx = app.groups.iter().position(|g| g.hash == picked).unwrap();
+            assert!(app.is_selected(idx));
+        }
+    }
+
+    #[test]
+    fn m_toggles_a_group_in_and_out() {
+        let mut app = app_with_results();
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.selected_count(), 1);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn a_selects_all_then_clears() {
+        let mut app = app_with_results();
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.selected_count(), app.groups.len());
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn shift_down_extends_a_contiguous_block() {
+        let mut app = app_with_results_of(5);
+        app.group_selected = 1;
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        }
+        assert_eq!(app.group_selected, 3);
+        assert_eq!(app.selected_count(), 3, "rows 1..=3");
+        for idx in 1..=3 {
+            assert!(app.is_selected(idx), "row {idx} should be selected");
+        }
+        assert!(!app.is_selected(0) && !app.is_selected(4));
+    }
+
+    /// Reversing direction must shrink the block, not leave rows behind.
+    #[test]
+    fn reversing_a_shift_extension_shrinks_the_block() {
+        let mut app = app_with_results_of(5);
+        app.group_selected = 0;
+        for _ in 0..3 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        }
+        assert_eq!(app.selected_count(), 4, "rows 0..=3");
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.selected_count(),
+            3,
+            "coming back up must deselect the row we left"
+        );
+        assert!(!app.is_selected(3), "row 3 should no longer be selected");
+    }
+
+    #[test]
+    fn shift_extension_preserves_an_earlier_manual_selection() {
+        let mut app = app_with_results_of(5);
+        app.group_selected = 4;
+        press(&mut app, KeyCode::Char('m')); // mark the last row
+        let manual = app.groups[4].hash;
+
+        app.group_selected = 0;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(
+            app.selected.contains(&manual),
+            "an extension must not discard what was already marked"
+        );
+        assert_eq!(app.selected_count(), 3, "rows 0..=1 plus the manual row 4");
+    }
+
+    #[test]
+    fn jk_extend_the_block_like_shift_arrows() {
+        let mut app = app_with_results_of(5);
+        app.group_selected = 0;
+        press(&mut app, KeyCode::Char('J'));
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.selected_count(), 3);
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(app.selected_count(), 2, "K shrinks it again");
+    }
+
+    #[test]
+    fn a_plain_arrow_ends_the_block() {
+        let mut app = app_with_results_of(5);
+        app.group_selected = 0;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.selected_count(), 2);
+
+        press(&mut app, KeyCode::Down); // ends the extension
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        // A new anchor started at row 2, so rows 2..=3 join the existing two.
+        assert!(app.is_selected(2) && app.is_selected(3));
+        assert_eq!(app.selected_count(), 4);
+    }
+
+    #[test]
+    fn escape_clears_a_selection_before_leaving_the_screen() {
+        let mut app = app_with_results();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected_count(), 0);
+        assert_eq!(app.screen, Screen::Results, "first Esc only clears");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Picker, "second Esc leaves");
+    }
+
+    // --------------------------------------------------- selection scoping
+
+    /// The whole point: a batch delete must not touch groups outside the
+    /// selection. The user's case is a DLL shared by two applications.
+    #[test]
+    fn a_batch_delete_ignores_unselected_groups() {
+        let mut app = app_with_results_of(3);
+        // Select groups 0 and 2, leaving 1 alone.
+        app.group_selected = 0;
+        press(&mut app, KeyCode::Char('m'));
+        app.group_selected = 2;
+        press(&mut app, KeyCode::Char('m'));
+
+        let protected: Vec<PathBuf> = app.groups[1].files.iter().map(|f| f.path.clone()).collect();
+        let targets = app.planned_targets();
+
+        assert!(!targets.is_empty(), "the selected groups still have marks");
+        for (path, _) in &targets {
+            assert!(
+                !protected.contains(path),
+                "{path:?} is in an unselected group and must be spared"
+            );
+        }
+    }
+
+    /// The header number must equal what D will act on, or it misleads about an
+    /// irreversible action.
+    #[test]
+    fn the_totals_match_the_scoped_target_list() {
+        let mut app = app_with_results_of(4);
+        assert_eq!(app.total_marked(), app.planned_targets().len());
+
+        app.group_selected = 1;
+        press(&mut app, KeyCode::Char('m'));
+
+        let targets = app.planned_targets();
+        assert_eq!(app.total_marked(), targets.len());
+        assert_eq!(
+            app.total_reclaimable(),
+            targets.iter().map(|(_, s)| s).sum::<u64>()
+        );
+        assert_eq!(targets.len(), 1, "one group of two copies, one marked");
+    }
+
+    #[test]
+    fn an_empty_selection_still_covers_every_group() {
+        let mut app = app_with_results_of(4);
+        let all_marked = app.total_marked();
+        let all_bytes = app.total_reclaimable();
+        let all_targets = app.planned_targets().len();
+
+        // Select then clear: the scope must return to everything.
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected_count(), 0);
+        assert_eq!(app.total_marked(), all_marked);
+        assert_eq!(app.total_reclaimable(), all_bytes);
+        assert_eq!(app.planned_targets().len(), all_targets);
+    }
+
+    #[test]
+    fn a_keeper_strategy_only_touches_selected_groups() {
+        let mut app = app_with_results_of(3);
+        app.group_selected = 0;
+        press(&mut app, KeyCode::Char('m'));
+
+        // Group 1 is unselected; note which copy it keeps.
+        let untouched = app.groups[1]
+            .files
+            .iter()
+            .position(|f| f.keep)
+            .expect("a keeper exists");
+
+        press(&mut app, KeyCode::Char('2')); // keep newest, in scope only
+
+        assert_eq!(
+            app.groups[1].files.iter().position(|f| f.keep),
+            Some(untouched),
+            "an unselected group must keep the copy it had"
+        );
+        // The selected group followed the strategy (b.bin is newer).
+        assert_eq!(
+            app.groups[0].files.iter().position(|f| f.keep),
+            Some(1),
+            "the selected group should now keep the newest copy"
+        );
+    }
+
+    #[test]
+    fn x_skips_every_selected_group_at_once() {
+        let mut app = app_with_results_of(4);
+        app.group_selected = 0;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.selected_count(), 3);
+
+        press(&mut app, KeyCode::Char('x'));
+        for idx in 0..3 {
+            assert!(app.groups[idx].skipped, "group {idx} should be skipped");
+        }
+        assert!(!app.groups[3].skipped, "the unselected group is untouched");
+
+        // A second press moves them all back, rather than flipping each.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.groups[..3].iter().all(|g| !g.skipped));
+    }
+
+    #[test]
+    fn a_mixed_selection_skips_rather_than_flipping() {
+        let mut app = app_with_results_of(3);
+        app.groups[0].skipped = true;
+        app.selected = app.groups.iter().map(|g| g.hash).collect();
+
+        // One is already skipped: the whole selection should end up skipped,
+        // not have that one toggled back on.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            app.groups.iter().all(|g| g.skipped),
+            "a mixed selection resolves to all-skipped"
+        );
+    }
+
+    #[test]
+    fn scoping_never_leaves_a_group_without_a_keeper() {
+        let mut app = app_with_results_of(4);
+        press(&mut app, KeyCode::Char('a'));
+        for code in ['1', '2', '3', '4'] {
+            press(&mut app, KeyCode::Char(code));
+            for (i, g) in app.groups.iter().enumerate() {
+                assert_eq!(g.keeper_count(), 1, "group {i} after {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_completed_delete_clears_the_selection() {
+        let mut app = app_with_results_of(3);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.selected_count() > 0);
+
+        let gone = vec![app.groups[0].files[1].path.clone()];
+        app.handle_delete_msg(DeleteMsg::Done(DeleteReport {
+            deleted: 1,
+            bytes_freed: 10,
+            failures: Vec::new(),
+            mode_label: "Trash".into(),
+            deleted_paths: gone,
+        }));
+        assert_eq!(
+            app.selected_count(),
+            0,
+            "a stale selection would silently scope the next action"
+        );
     }
 
     #[test]

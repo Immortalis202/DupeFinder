@@ -93,10 +93,15 @@ pub enum DeleteMsg {
     Done(DeleteReport),
 }
 
-/// Every file the current marks would remove, paired with its size.
-pub fn pending(groups: &[DupeGroup]) -> Vec<(PathBuf, u64)> {
+/// Every file the marks would remove across `groups`, paired with its size.
+///
+/// Takes an iterator so a caller can narrow the set of groups first -- the
+/// dashboard passes only the groups a selection covers. Keeping the
+/// "not skipped, not kept" rule in one place stops the scoped and unscoped
+/// paths from drifting apart.
+pub fn pending_in<'a>(groups: impl IntoIterator<Item = &'a DupeGroup>) -> Vec<(PathBuf, u64)> {
     groups
-        .iter()
+        .into_iter()
         .filter(|g| !g.skipped)
         .flat_map(|g| {
             g.files
@@ -105,16 +110,6 @@ pub fn pending(groups: &[DupeGroup]) -> Vec<(PathBuf, u64)> {
                 .map(|f| (f.path.clone(), f.size))
         })
         .collect()
-}
-
-/// Total bytes the current marks would free.
-pub fn pending_bytes(groups: &[DupeGroup]) -> u64 {
-    groups.iter().map(DupeGroup::reclaimable).sum()
-}
-
-/// Total files the current marks would remove.
-pub fn pending_count(groups: &[DupeGroup]) -> usize {
-    groups.iter().map(DupeGroup::marked).sum()
 }
 
 /// Delete `targets`, one at a time, reporting progress through `state`.
@@ -208,7 +203,7 @@ mod tests {
     fn pending_lists_only_the_unkept_copies() {
         let dir = tempfile::tempdir().unwrap();
         let group = on_disk_group(dir.path());
-        let targets = pending(std::slice::from_ref(&group));
+        let targets = pending_in([&group]);
 
         assert_eq!(targets.len(), 2);
         assert!(
@@ -222,20 +217,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut group = on_disk_group(dir.path());
         group.skipped = true;
-        assert!(pending(&[group]).is_empty());
+        assert!(pending_in([&group]).is_empty());
     }
 
     #[test]
-    fn pending_totals_agree_with_the_target_list() {
+    fn pending_totals_agree_with_the_group_arithmetic() {
         let dir = tempfile::tempdir().unwrap();
         let group = on_disk_group(dir.path());
-        let groups = std::slice::from_ref(&group);
-        let targets = pending(groups);
+        let targets = pending_in([&group]);
 
-        assert_eq!(pending_count(groups), targets.len());
+        assert_eq!(targets.len(), group.marked());
         assert_eq!(
-            pending_bytes(groups),
-            targets.iter().map(|(_, s)| s).sum::<u64>()
+            targets.iter().map(|(_, s)| s).sum::<u64>(),
+            group.reclaimable()
+        );
+    }
+
+    #[test]
+    fn pending_in_narrows_to_the_groups_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = on_disk_group(&{
+            let p = dir.path().join("a");
+            std::fs::create_dir(&p).unwrap();
+            p
+        });
+        let b = on_disk_group(&{
+            let p = dir.path().join("b");
+            std::fs::create_dir(&p).unwrap();
+            p
+        });
+
+        let both = pending_in([&a, &b]);
+        let just_a = pending_in([&a]);
+        assert_eq!(both.len(), just_a.len() * 2);
+        assert!(
+            just_a
+                .iter()
+                .all(|(p, _)| p.starts_with(dir.path().join("a")))
         );
     }
 
@@ -243,7 +261,7 @@ mod tests {
     fn permanent_deletion_removes_the_marked_copies_and_keeps_the_keeper() {
         let dir = tempfile::tempdir().unwrap();
         let group = on_disk_group(dir.path());
-        let report = run_sync(pending(std::slice::from_ref(&group)), DeleteMode::Permanent);
+        let report = run_sync(pending_in([&group]), DeleteMode::Permanent);
 
         assert_eq!(report.deleted, 2);
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -268,7 +286,7 @@ mod tests {
             .unwrap();
         group.keep_only(keep_idx);
 
-        let report = run_sync(pending(std::slice::from_ref(&group)), DeleteMode::Permanent);
+        let report = run_sync(pending_in([&group]), DeleteMode::Permanent);
 
         assert_eq!(report.deleted, 2);
         assert!(
@@ -374,7 +392,7 @@ mod tests {
             groups.push(group);
         }
 
-        let report = run_sync(pending(&groups), DeleteMode::Permanent);
+        let report = run_sync(pending_in(groups.iter()), DeleteMode::Permanent);
         assert_eq!(
             report.deleted, 6,
             "two of three copies in each of three groups"

@@ -71,6 +71,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!(" · sort {}", app.sort.label()),
             Style::default().fg(DIM),
         ),
+        Span::styled(" · scope ", Style::default().fg(DIM)),
+        if app.selected_count() > 0 {
+            Span::styled(
+                format!("{} selected", app.selected_count()),
+                Style::default().fg(KEEP).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                format!("all {} groups", app.groups.len()),
+                Style::default().fg(DIM),
+            )
+        },
     ]);
 
     frame.render_widget(
@@ -89,11 +101,16 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .groups
         .iter()
-        .map(|g| {
-            // "118.0 MiB ×4  backup.tar.gz"
+        .enumerate()
+        .map(|(idx, g)| {
+            // "118.0 MiB x4  backup.tar.gz", behind a two-column marker gutter.
             let size = format!("{:>10}", format::bytes(g.size));
             let count = format!(" ×{:<3}", g.files.len());
-            let used = size.chars().count() + count.chars().count() + 1;
+            let selected = app.is_selected(idx);
+            // ASCII only: glyphs whose rendered width disagrees with
+            // unicode-width were already removed from this UI once.
+            let marker = if selected { "* " } else { "  " };
+            let used = marker.len() + size.chars().count() + count.chars().count() + 1;
             let name = format::truncate(&g.label(), inner_width.saturating_sub(used));
 
             let name_style = if g.skipped {
@@ -103,6 +120,10 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             ListItem::new(Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(KEEP).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(size, Style::default().fg(ACCENT)),
                 Span::styled(count, Style::default().fg(DIM)),
                 Span::raw(" "),

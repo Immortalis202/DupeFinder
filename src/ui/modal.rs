@@ -50,7 +50,8 @@ pub fn draw_confirm(frame: &mut Frame, app: &App) {
     let group_count = app
         .groups
         .iter()
-        .filter(|g| !g.skipped && g.marked() > 0)
+        .enumerate()
+        .filter(|(idx, g)| !g.skipped && g.marked() > 0 && app.in_scope(*idx))
         .count();
 
     let body = vec![
@@ -70,7 +71,15 @@ pub fn draw_confirm(frame: &mut Frame, app: &App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" group{}?", if group_count == 1 { "" } else { "s" }),
+                format!(
+                    " {}group{}?",
+                    if app.selected_count() > 0 {
+                        "selected "
+                    } else {
+                        ""
+                    },
+                    if group_count == 1 { "" } else { "s" }
+                ),
                 Style::default(),
             ),
         ]),

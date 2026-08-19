@@ -92,7 +92,19 @@ exactly the highlighted file, whatever its mark, without needing you to unmark
 everything else first. It confirms, names the file, and says how many copies
 would remain. It refuses on the last remaining copy.
 
-Bulk keeper choices, applied to **every** group at once:
+**Selecting groups** — `m` marks the highlighted group, `Shift+↑`/`Shift+↓` (or
+`K`/`J`) extend a contiguous block, `a` selects all or clears, `Esc` clears the
+selection.
+
+Once any group is selected, **every bulk key acts only on the selection**: `D`
+deletes just within it, `1`–`4` set the keeper only there, and `x` skips or
+un-skips the whole block at once. This is how you cherry-pick a batch delete
+around groups you must not touch — a DLL that two applications legitimately
+share, for example. With nothing selected the bulk keys act on every group, as
+before. The header always states which: `scope 12 selected` or
+`scope all 318 groups`, and the confirmation repeats it.
+
+Bulk keeper choices, applied to every group **in scope**:
 
 | Key | Keeps |
 |---|---|
@@ -114,7 +126,9 @@ Bulk keeper choices, applied to **every** group at once:
   Permanent deletion requires switching mode with `t`, and the confirmation
   dialog says plainly which one is about to happen.
 - **Nothing is deleted without confirmation**, showing the file count, the bytes
-  to be freed, and the mode.
+  to be freed, the mode, and whether the delete is narrowed to a selection. The
+  `marked` and `reclaims` figures in the header are scoped the same way, so the
+  number you read is the number that will be acted on.
 - **Hardlinks are collapsed by default.** Two names for one file free no space
   when one is deleted, so they are reported as a single entry.
 - **A file that fails to delete stays listed** and is reported individually; one
@@ -205,7 +219,7 @@ supported Rust version so `rust-version` in `Cargo.toml` cannot drift.
 cargo test
 ```
 
-123 tests covering the scanner against fixture trees with known answers
+145 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.
