@@ -179,7 +179,9 @@ fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
         .files
         .iter()
         .map(|f| {
-            let (mark, colour) = if group.skipped {
+            let (mark, colour) = if f.protected {
+                ("REF     ", ACCENT)
+            } else if group.skipped {
                 ("— SKIP  ", DIM)
             } else if f.keep {
                 ("● KEEP  ", KEEP)
@@ -250,6 +252,13 @@ fn detail_lines(group: &DupeGroup, app: &App, width: usize) -> Vec<Line<'static>
     // the narrow case does not spend columns repeating the same number.
     if group.reclaimable() != group.wasted() {
         pairs.push(("reclaims", format::bytes(group.reclaimable())));
+    }
+    if group
+        .files
+        .get(app.file_selected)
+        .is_some_and(|file| file.protected)
+    {
+        pairs.push(("reference", "protected".to_string()));
     }
     pairs.push(("modified", modified));
     pairs.push(("blake3", group.hash_prefix()));

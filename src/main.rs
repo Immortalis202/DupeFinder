@@ -1,8 +1,10 @@
 //! dupefind — a terminal UI for finding and removing duplicate files.
 
 mod app;
+mod cache;
 mod cli;
 mod delete;
+mod export;
 mod format;
 mod model;
 mod scan;
@@ -27,6 +29,18 @@ const POLL_IDLE: Duration = Duration::from_millis(250);
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.clear_cache {
+        println!(
+            "{}",
+            if cache::clear_default().context("cannot clear hash cache")? {
+                "Hash cache cleared."
+            } else {
+                "Hash cache was already empty."
+            }
+        );
+        return Ok(());
+    }
+
     // Resolve the starting directory before touching the terminal, so a bad path
     // produces an ordinary error message rather than a corrupted screen.
     let start_dir = match &args.directory {
@@ -39,7 +53,38 @@ fn main() -> Result<()> {
         anyhow::bail!("{} is not a directory", start_dir.display());
     }
 
-    let mut app = App::new(start_dir.clone(), args.scan_options(), args.delete_mode());
+    let mut options = args.scan_options();
+    options.reference_roots = options
+        .reference_roots
+        .iter()
+        .map(|path| {
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("cannot open reference directory {}", path.display()))?;
+            if !canonical.is_dir() {
+                anyhow::bail!("reference path is not a directory: {}", canonical.display());
+            }
+            Ok(canonical)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let export_dir = args
+        .export_dir
+        .as_ref()
+        .map(|path| {
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("cannot open export directory {}", path.display()))?;
+            if !canonical.is_dir() {
+                anyhow::bail!("export path is not a directory: {}", canonical.display());
+            }
+            Ok(canonical)
+        })
+        .transpose()?
+        .unwrap_or(std::env::current_dir().context("cannot determine the export directory")?);
+
+    let mut app = App::new(start_dir.clone(), options, args.delete_mode());
+    app.export_dir = export_dir;
 
     // An explicit path means the user already chose; skip the browser.
     if args.directory.is_some() {

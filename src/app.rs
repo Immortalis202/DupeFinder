@@ -11,6 +11,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::delete::{self, DeleteMode, DeleteMsg, DeleteReport, DeleteState};
+use crate::export;
 use crate::model::{
     DupeGroup, KeepStrategy, Phase, ScanError, ScanMsg, ScanOptions, ScanState, SortKey,
 };
@@ -113,6 +114,7 @@ pub struct App {
     pub pane: Pane,
     pub sort: SortKey,
     pub status: Option<String>,
+    pub export_dir: PathBuf,
     pub plan: DeletePlan,
     /// Groups the user has picked out, keyed by content hash so the selection
     /// survives re-sorting. When non-empty it scopes every bulk action.
@@ -136,7 +138,7 @@ impl App {
             should_quit: false,
             options,
             delete_mode,
-            cwd: start_dir,
+            cwd: start_dir.clone(),
             entries: Vec::new(),
             picker_selected: 0,
             show_hidden_in_picker: false,
@@ -154,6 +156,7 @@ impl App {
             pane: Pane::Groups,
             sort: SortKey::Wasted,
             status: None,
+            export_dir: std::env::current_dir().unwrap_or_else(|_| start_dir.clone()),
             plan: DeletePlan::Marked,
             selected: HashSet::new(),
             shift_anchor: None,
@@ -321,6 +324,21 @@ impl App {
 
     /// Spawn the scanner on the current directory.
     pub fn start_scan(&mut self, root: PathBuf) {
+        if let Some(reference) = self
+            .options
+            .reference_roots
+            .iter()
+            .find(|reference| root.starts_with(reference.as_path()))
+        {
+            self.status = Some(format!(
+                "Reference {} contains the scan root; choose a nested or external reference",
+                reference.display()
+            ));
+            self.screen = Screen::Picker;
+            return;
+        }
+        self.options.reference_roots.sort();
+        self.options.reference_roots.dedup();
         let (tx, rx): (Sender<ScanMsg>, Receiver<ScanMsg>) = crossbeam_channel::unbounded();
         self.scan_state = Arc::new(ScanState::default());
         self.scan_rx = Some(rx);
@@ -602,6 +620,7 @@ impl App {
                 .groups
                 .get(group)
                 .and_then(|g| g.files.get(file))
+                .filter(|f| !f.protected)
                 .map(|f| vec![(f.path.clone(), f.size)])
                 .unwrap_or_default(),
         }
@@ -749,6 +768,8 @@ impl App {
             KeyCode::Char('4') => {
                 self.options.collapse_hardlinks = !self.options.collapse_hardlinks;
             }
+            KeyCode::Char('5') => self.options.use_cache = !self.options.use_cache,
+            KeyCode::Char('R') => self.toggle_reference_target(),
             _ => {}
         }
     }
@@ -829,11 +850,22 @@ impl App {
             }
             KeyCode::Char('d') => {
                 let idx = self.file_selected;
-                let refused = match self.groups.get_mut(self.group_selected) {
-                    Some(group) => !group.toggle_mark(idx),
-                    None => false,
+                let protected = self
+                    .groups
+                    .get(self.group_selected)
+                    .and_then(|group| group.files.get(idx))
+                    .is_some_and(|file| file.protected);
+                let refused = if protected {
+                    true
+                } else {
+                    match self.groups.get_mut(self.group_selected) {
+                        Some(group) => !group.toggle_mark(idx),
+                        None => false,
+                    }
                 };
-                if refused {
+                if protected {
+                    self.status = Some("Reference files are protected from deletion".to_string());
+                } else if refused {
                     self.status = Some("At least one copy in a group must be kept".to_string());
                 }
                 self.pane = Pane::Files;
@@ -863,6 +895,14 @@ impl App {
             // Delete just the highlighted copy, whatever its mark. Useful when
             // one file is obviously junk and the rest need no decision.
             KeyCode::Delete => match self.groups.get(self.group_selected) {
+                Some(group)
+                    if group
+                        .files
+                        .get(self.file_selected)
+                        .is_some_and(|file| file.protected) =>
+                {
+                    self.status = Some("Reference files are protected from deletion".to_string());
+                }
                 Some(group) if group.files.len() > 1 => {
                     self.pane = Pane::Files;
                     self.plan = DeletePlan::Single {
@@ -882,8 +922,73 @@ impl App {
                     self.start_scan(root);
                 }
             }
+            KeyCode::Char('e') => self.export_results(),
             _ => {}
         }
+    }
+
+    fn toggle_reference_target(&mut self) {
+        let target = self.scan_target();
+        let Ok(target) = target.canonicalize() else {
+            self.status = Some(format!("Cannot resolve reference {}", target.display()));
+            return;
+        };
+        if let Some(index) = self
+            .options
+            .reference_roots
+            .iter()
+            .position(|root| root == &target)
+        {
+            self.options.reference_roots.remove(index);
+            self.status = Some(format!("Unprotected {}", target.display()));
+            return;
+        }
+        if let Some(parent) = self
+            .options
+            .reference_roots
+            .iter()
+            .find(|root| target.starts_with(root.as_path()))
+        {
+            self.status = Some(format!("Already protected by {}", parent.display()));
+            return;
+        }
+        self.options
+            .reference_roots
+            .retain(|root| !root.starts_with(&target));
+        self.options.reference_roots.push(target.clone());
+        self.options.reference_roots.sort();
+        self.status = Some(format!("Protected {}", target.display()));
+    }
+
+    fn export_results(&mut self) {
+        let Some(root) = self.scan_root.as_deref() else {
+            self.status = Some("Nothing has been scanned yet".to_string());
+            return;
+        };
+        let outcome = export::write_results(
+            &self.export_dir,
+            root,
+            &self.options,
+            self.elapsed(),
+            &self.groups,
+            &self.selected,
+        );
+        self.status = Some(match (outcome.json, outcome.text) {
+            (Ok(json), Ok(text)) => format!(
+                "Exported {} and {}",
+                json.file_name().unwrap_or_default().to_string_lossy(),
+                text.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            (Ok(path), Err(err)) => format!(
+                "Exported {}; text export failed: {err}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            (Err(err), Ok(path)) => format!(
+                "JSON export failed: {err}; exported {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            (Err(json), Err(text)) => format!("Export failed: JSON: {json}; text: {text}"),
+        });
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -951,6 +1056,7 @@ impl App {
                     self.start_scan(root);
                 }
             }
+            KeyCode::Char('e') => self.export_results(),
             KeyCode::Enter => {
                 self.report = None;
                 self.screen = Screen::Results;
@@ -2526,6 +2632,34 @@ mod tests {
         assert!(app.options.respect_gitignore);
         press(&mut app, KeyCode::Char('2'));
         assert!(!app.options.respect_gitignore);
+        assert!(!app.options.use_cache);
+        press(&mut app, KeyCode::Char('5'));
+        assert!(app.options.use_cache);
+    }
+
+    #[test]
+    fn the_picker_can_toggle_a_reference_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        std::fs::create_dir(&reference).unwrap();
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            DeleteMode::Trash,
+        );
+        app.picker_selected = app
+            .entries
+            .iter()
+            .position(|row| row.path == reference)
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('R'));
+        assert_eq!(
+            app.options.reference_roots,
+            vec![reference.canonicalize().unwrap()]
+        );
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.options.reference_roots.is_empty());
     }
 
     #[test]

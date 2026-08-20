@@ -103,6 +103,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
         ]),
         stat_line(vec![
             stat("hashed", format::bytes(ScanState::get(&state.bytes_hashed))),
+            stat(
+                "cache hits",
+                format::count(ScanState::get(&state.cache_hits)),
+            ),
             // Divide by time spent reading, not by total scan time: the walk
             // stats every file in the tree and can easily outlast the reading,
             // which made this figure read far below what the disk delivers.

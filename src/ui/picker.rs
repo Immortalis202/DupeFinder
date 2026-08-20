@@ -17,7 +17,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
         toggle("gitignore", app.options.respect_gitignore),
         toggle("empty", !app.options.skip_empty),
         toggle("hardlinks", app.options.collapse_hardlinks),
+        toggle("cache", app.options.use_cache),
     ];
+    if !app.options.reference_roots.is_empty() {
+        filter_parts.push(vec![
+            Span::styled("references ", Style::default().fg(DIM)),
+            Span::styled(
+                app.options.reference_roots.len().to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
     // An exclusion set silently shrinks the results, so say so.
     if !app.options.exclude_exts.is_empty() {
         filter_parts.push(vec![

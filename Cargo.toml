@@ -7,6 +7,12 @@ description = "A terminal UI for finding and removing duplicate files by content
 license = "MIT"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+directories = "6"
+base64 = "0.22"
+tempfile = "3"
 ratatui = "0.30.2"
 ignore = "0.4.33"
 blake3 = "1.8.6"
@@ -17,9 +23,6 @@ trash = "5.2"
 humansize = "2.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

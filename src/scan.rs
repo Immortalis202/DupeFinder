@@ -12,7 +12,8 @@
 //! Phase 2 is what makes this fast: on a typical tree it eliminates the large
 //! majority of files without opening any of them.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use same_file::Handle;
 
+use crate::cache::{CachedHashes, HashCache};
 use crate::model::{DupeGroup, FileEntry, Phase, ScanError, ScanMsg, ScanOptions, ScanState};
 
 /// How much of the front of a file the head-hash phase reads.
@@ -33,10 +35,18 @@ const HEAD_HASH_BYTES: u64 = 16 * 1024;
 /// Read buffer for full-file hashing.
 const READ_BUFFER: usize = 128 * 1024;
 
+thread_local! {
+    /// Rayon workers keep this allocation across files and across both passes.
+    static HASH_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0u8; READ_BUFFER]);
+}
+
 /// A candidate file carried between phases.
 struct Candidate {
     path: PathBuf,
     size: u64,
+    modified: Option<SystemTime>,
+    protected: bool,
+    cached: Option<CachedHashes>,
 }
 
 /// Run a full scan. Intended to be called on a dedicated thread; progress is
@@ -46,7 +56,13 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     // from when the scan began.
     let started = Instant::now();
 
-    let by_size = match walk(&root, &options, &state, &tx) {
+    let (mut cache, cache_warning) = HashCache::open(options.use_cache, options.cache_min_size);
+    if let Some(warning) = cache_warning {
+        ScanState::bump(&state.errors, 1);
+        let _ = tx.send(ScanMsg::Error(ScanError::new(None, warning)));
+    }
+
+    let by_size = match walk(&root, &options, &state, &tx, &mut cache) {
         Some(map) => map,
         None => {
             let _ = tx.send(ScanMsg::Cancelled);
@@ -79,7 +95,7 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     state.files_hashed.store(0, Ordering::Relaxed);
 
     let _ = tx.send(ScanMsg::Phase(Phase::FullHashing));
-    let groups = match full_hash_pass(candidates, &state, &tx, started) {
+    let groups = match full_hash_pass(candidates, &state, &tx, started, &mut cache) {
         Some(g) => g,
         None => {
             let _ = tx.send(ScanMsg::Cancelled);
@@ -101,6 +117,14 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
             .then_with(|| a.size.cmp(&b.size))
     });
 
+    if let Err(err) = cache.save() {
+        ScanState::bump(&state.errors, 1);
+        let _ = tx.send(ScanMsg::Error(ScanError::new(
+            None,
+            format!("cannot save hash cache: {err}"),
+        )));
+    }
+
     let _ = tx.send(ScanMsg::Done(groups));
 }
 
@@ -110,9 +134,25 @@ fn walk(
     options: &ScanOptions,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
+    cache: &mut HashCache,
 ) -> Option<HashMap<u64, Vec<Candidate>>> {
     let _ = tx.send(ScanMsg::Phase(Phase::Walking));
 
+    let mut by_size: HashMap<u64, Vec<Candidate>> = HashMap::new();
+    for walk_root in traversal_roots(root, &options.reference_roots) {
+        walk_one(&walk_root, options, state, tx, cache, &mut by_size)?;
+    }
+    Some(by_size)
+}
+
+fn walk_one(
+    root: &Path,
+    options: &ScanOptions,
+    state: &Arc<ScanState>,
+    tx: &Sender<ScanMsg>,
+    cache: &mut HashCache,
+    by_size: &mut HashMap<u64, Vec<Candidate>>,
+) -> Option<()> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(options.skip_hidden)
@@ -126,8 +166,6 @@ fn walk(
         .require_git(false)
         .follow_links(options.follow_links)
         .same_file_system(options.same_file_system);
-
-    let mut by_size: HashMap<u64, Vec<Candidate>> = HashMap::new();
 
     for result in builder.build() {
         if state.is_cancelled() {
@@ -179,6 +217,7 @@ fn walk(
         }
 
         let size = metadata.len();
+        let modified = metadata.modified().ok();
         ScanState::bump(&state.files_seen, 1);
         ScanState::bump(&state.bytes_seen, size);
 
@@ -190,13 +229,40 @@ fn walk(
             continue;
         }
 
+        let path = entry.path().to_path_buf();
+        let cached = cache.lookup(&path, size, modified);
         by_size.entry(size).or_default().push(Candidate {
-            path: entry.path().to_path_buf(),
+            protected: is_protected(&path, &options.reference_roots),
+            path,
             size,
+            modified,
+            cached,
         });
     }
 
-    Some(by_size)
+    Some(())
+}
+
+/// Main-root contents are walked once. Disjoint external reference roots are
+/// added, while nested references are classified during that existing walk.
+fn traversal_roots(root: &Path, references: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    let mut external: Vec<PathBuf> = references
+        .iter()
+        .filter(|reference| !reference.starts_with(root))
+        .cloned()
+        .collect();
+    external.sort_by_key(|path| path.components().count());
+    for reference in external {
+        if !roots.iter().any(|existing| reference.starts_with(existing)) {
+            roots.push(reference);
+        }
+    }
+    roots
+}
+
+fn is_protected(path: &Path, references: &[PathBuf]) -> bool {
+    references.iter().any(|root| path.starts_with(root))
 }
 
 /// On Windows, skip junctions and other reparse points so the walk cannot loop
@@ -242,9 +308,21 @@ fn head_hash_pass(
         return Some(small);
     }
 
-    let hashed = hash_in_parallel(large, state, tx, started, |path| {
+    let (cached, uncached): (Vec<_>, Vec<_>) = large
+        .into_iter()
+        .partition(|candidate| candidate.cached.is_some());
+    let mut hashed: Vec<(Candidate, [u8; 32])> = cached
+        .into_iter()
+        .map(|candidate| {
+            let hash = candidate.cached.expect("partitioned cache hit").prefix;
+            ScanState::bump(&state.files_hashed, 1);
+            ScanState::bump(&state.cache_hits, 1);
+            (candidate, hash)
+        })
+        .collect();
+    hashed.extend(hash_in_parallel(uncached, state, tx, started, |path| {
         hash_prefix_of(path, HEAD_HASH_BYTES)
-    })?;
+    })?);
 
     // Group by (size, head hash): a shared head is necessary but not sufficient.
     let mut buckets: HashMap<(u64, [u8; 32]), Vec<Candidate>> = HashMap::new();
@@ -270,8 +348,31 @@ fn full_hash_pass(
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
     started: Instant,
+    cache: &mut HashCache,
 ) -> Option<HashMap<[u8; 32], Vec<Candidate>>> {
-    let hashed = hash_in_parallel(candidates, state, tx, started, hash_whole_file)?;
+    let (cached, fresh): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|candidate| candidate.cached.is_some());
+    let mut hashed: Vec<(Candidate, [u8; 32])> = cached
+        .into_iter()
+        .map(|candidate| {
+            let full = candidate.cached.expect("partitioned cache hit").full;
+            ScanState::bump(&state.files_hashed, 1);
+            ScanState::bump(&state.cache_hits, 1);
+            (candidate, full)
+        })
+        .collect();
+
+    let computed = hash_full_in_parallel(fresh, state, tx, started)?;
+    for (candidate, hashes) in computed {
+        cache.insert(
+            candidate.path.clone(),
+            candidate.size,
+            candidate.modified,
+            hashes,
+        );
+        hashed.push((candidate, hashes.full));
+    }
 
     let mut buckets: HashMap<[u8; 32], Vec<Candidate>> = HashMap::new();
     for (candidate, hash) in hashed {
@@ -279,6 +380,48 @@ fn full_hash_pass(
     }
     buckets.retain(|_, bucket| bucket.len() > 1);
     Some(buckets)
+}
+
+fn hash_full_in_parallel(
+    mut candidates: Vec<Candidate>,
+    state: &Arc<ScanState>,
+    tx: &Sender<ScanMsg>,
+    started: Instant,
+) -> Option<Vec<(Candidate, CachedHashes)>> {
+    sort_for_sequential_reads(&mut candidates);
+    if !candidates.is_empty() {
+        state.mark_hashing_started(started.elapsed());
+    }
+    let out: Vec<_> = candidates
+        .into_par_iter()
+        .filter_map(|candidate| {
+            if state.is_cancelled() {
+                return None;
+            }
+            state.set_current(&candidate.path.to_string_lossy());
+            match hash_whole_file_with_prefix(&candidate.path) {
+                Ok((hashes, read)) => {
+                    ScanState::bump(&state.files_hashed, 1);
+                    ScanState::bump(&state.bytes_hashed, read);
+                    Some((candidate, hashes))
+                }
+                Err(err) => {
+                    ScanState::bump(&state.errors, 1);
+                    ScanState::bump(&state.files_hashed, 1);
+                    let _ = tx.send(ScanMsg::Error(ScanError::new(
+                        Some(candidate.path.clone()),
+                        err.to_string(),
+                    )));
+                    None
+                }
+            }
+        })
+        .collect();
+    if state.is_cancelled() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Put candidates in path order, so that reads walk the tree instead of
@@ -355,9 +498,42 @@ where
 }
 
 /// BLAKE3 of the whole file. Returns the digest and the number of bytes read.
-/// BLAKE3 of the whole file. Returns the digest and the number of bytes read.
+#[cfg(test)]
 fn hash_whole_file(path: &Path) -> std::io::Result<([u8; 32], u64)> {
-    hash_upto(path, u64::MAX)
+    hash_whole_file_with_prefix(path).map(|(hashes, read)| (hashes.full, read))
+}
+
+/// Compute the authoritative digest and the cache's fixed prefix digest during
+/// one read. The second hasher only sees the first 16 KiB.
+fn hash_whole_file_with_prefix(path: &Path) -> std::io::Result<(CachedHashes, u64)> {
+    let mut file = File::open(path)?;
+    let mut full = blake3::Hasher::new();
+    let mut prefix = blake3::Hasher::new();
+    let mut prefix_left = HEAD_HASH_BYTES as usize;
+    let mut total = 0u64;
+    HASH_BUFFER.with_borrow_mut(|buffer| -> std::io::Result<()> {
+        loop {
+            let n = file.read(buffer)?;
+            if n == 0 {
+                break;
+            }
+            full.update(&buffer[..n]);
+            if prefix_left > 0 {
+                let prefix_n = n.min(prefix_left);
+                prefix.update(&buffer[..prefix_n]);
+                prefix_left -= prefix_n;
+            }
+            total += n as u64;
+        }
+        Ok(())
+    })?;
+    Ok((
+        CachedHashes {
+            prefix: *prefix.finalize().as_bytes(),
+            full: *full.finalize().as_bytes(),
+        },
+        total,
+    ))
 }
 
 /// BLAKE3 of at most the first `limit` bytes.
@@ -365,7 +541,7 @@ fn hash_prefix_of(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
     hash_upto(path, limit)
 }
 
-/// Hash up to `limit` bytes of `path`, reading through a heap buffer.
+/// Hash up to `limit` bytes of `path`, reusing the current worker's heap buffer.
 ///
 /// Deliberately not `blake3::Hasher::update_reader`: that puts a 64 KiB array on
 /// the stack, and because hashing runs inside a rayon parallel collect -- whose
@@ -378,17 +554,19 @@ fn hash_prefix_of(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
 fn hash_upto(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
     let mut file = File::open(path)?.take(limit);
     let mut hasher = blake3::Hasher::new();
-    // Never allocate more than the caller could possibly read.
-    let mut buf = vec![0u8; READ_BUFFER.min(limit.max(1) as usize)];
     let mut total = 0u64;
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    HASH_BUFFER.with_borrow_mut(|buffer| -> std::io::Result<()> {
+        let usable = READ_BUFFER.min(limit.max(1) as usize);
+        loop {
+            let n = file.read(&mut buffer[..usable])?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+            total += n as u64;
         }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
+        Ok(())
+    })?;
     Ok((*hasher.finalize().as_bytes(), total))
 }
 
@@ -440,26 +618,42 @@ fn finalize_group(
     // Keyed on the handle rather than scanned linearly: a bucket is usually two
     // or three files, but a tree of vendored dependencies can produce one with
     // thousands, and a linear scan makes that quadratic.
-    let mut seen: HashSet<Handle> = HashSet::with_capacity(bucket.len());
+    let mut seen: HashMap<Handle, usize> = HashMap::with_capacity(bucket.len());
     let mut files: Vec<FileEntry> = Vec::with_capacity(bucket.len());
 
     for candidate in bucket {
         state.set_current(&candidate.path.to_string_lossy());
-        let (modified, handle) = identify(&candidate.path, options.collapse_hardlinks);
+        let handle = identify(&candidate.path, options.collapse_hardlinks);
         ScanState::bump(&state.files_checked, 1);
 
         // A second name for a file already here would free nothing if deleted.
-        if let Some(handle) = handle
-            && !seen.insert(handle)
-        {
-            continue;
+        if let Some(handle) = handle {
+            if let Some(&existing) = seen.get(&handle) {
+                // Prefer the protected spelling of a hardlinked file so a
+                // reference path can never disappear behind an ordinary alias.
+                if candidate.protected && !files[existing].protected {
+                    files[existing] = FileEntry::new_protected(
+                        candidate.path,
+                        candidate.size,
+                        candidate.modified,
+                        true,
+                    );
+                }
+                continue;
+            }
+            seen.insert(handle, files.len());
         }
 
-        files.push(FileEntry::new(candidate.path, candidate.size, modified));
+        files.push(FileEntry::new_protected(
+            candidate.path,
+            candidate.size,
+            candidate.modified,
+            candidate.protected,
+        ));
     }
 
     // A group of hardlinks to one inode is not a duplicate at all.
-    if files.len() < 2 {
+    if files.len() < 2 || files.iter().all(|file| file.protected) {
         return None;
     }
 
@@ -479,19 +673,17 @@ fn finalize_group(
 /// The handle is returned still open rather than reduced to a device and inode
 /// number, because on Windows a file index is only guaranteed to be stable while
 /// a handle to the file is held.
-fn identify(path: &Path, collapse_hardlinks: bool) -> (Option<SystemTime>, Option<Handle>) {
+fn identify(path: &Path, collapse_hardlinks: bool) -> Option<Handle> {
+    if !collapse_hardlinks {
+        return None;
+    }
     // Unreadable here means unreadable at deletion time too, where the error can
     // actually be reported to the user; keep the entry either way rather than
     // silently dropping a real duplicate.
     let Ok(file) = File::open(path) else {
-        return (None, None);
+        return None;
     };
-    let modified = file.metadata().ok().and_then(|m| m.modified().ok());
-
-    if !collapse_hardlinks {
-        return (modified, None);
-    }
-    (modified, Handle::from_file(file).ok())
+    Handle::from_file(file).ok()
 }
 
 /// Number of files hashed so far, for the progress gauge.
@@ -541,6 +733,9 @@ mod tests {
                 .map(|p| Candidate {
                     path: PathBuf::from(p),
                     size: 1,
+                    modified: None,
+                    protected: false,
+                    cached: None,
                 })
                 .collect();
 
@@ -617,6 +812,9 @@ mod tests {
             .map(|name| Candidate {
                 path: dir.path().join(name),
                 size: 55,
+                modified: None,
+                protected: false,
+                cached: None,
             })
             .collect();
         let mut buckets = HashMap::new();
@@ -912,6 +1110,79 @@ mod tests {
         let mut sorted = wasted.clone();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(wasted, sorted, "most wasteful group should come first");
+    }
+
+    #[test]
+    fn an_external_reference_matches_but_is_never_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("main");
+        let reference = dir.path().join("reference");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        let content = b"content shared with a protected archive";
+        fs::write(root.join("working.bin"), content).unwrap();
+        fs::write(reference.join("archive.bin"), content).unwrap();
+
+        let groups = scan_sync(
+            &root,
+            ScanOptions {
+                reference_roots: vec![reference.clone()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2);
+        let protected = groups[0]
+            .files
+            .iter()
+            .find(|file| file.path.starts_with(&reference))
+            .expect("the external reference file should join the group");
+        assert!(protected.protected && protected.keep);
+        assert_eq!(groups[0].marked(), 1);
+    }
+
+    #[test]
+    fn a_nested_reference_is_not_walked_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let reference = root.join("reference");
+        fs::create_dir_all(&reference).unwrap();
+        let content = b"one protected and one ordinary copy";
+        fs::write(root.join("working.bin"), content).unwrap();
+        fs::write(reference.join("archive.bin"), content).unwrap();
+
+        let groups = scan_sync(
+            root,
+            ScanOptions {
+                reference_roots: vec![reference],
+                ..Default::default()
+            },
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2, "the nested tree is walked once");
+        assert_eq!(
+            groups[0].files.iter().filter(|file| file.protected).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scan_metadata_is_carried_into_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"metadata should not require reopening during finalize";
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        fs::write(&first, content).unwrap();
+        fs::write(&second, content).unwrap();
+        let expected = fs::metadata(&first).unwrap().modified().ok();
+
+        let groups = scan_sync(dir.path(), ScanOptions::default());
+        let result = groups[0]
+            .files
+            .iter()
+            .find(|file| file.path == first)
+            .unwrap();
+        assert_eq!(result.modified, expected);
     }
 
     /// `hash_upto` replaced `blake3::Hasher::update_reader`, whose 64 KiB stack

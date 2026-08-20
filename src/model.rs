@@ -13,6 +13,8 @@ pub struct FileEntry {
     pub modified: Option<SystemTime>,
     /// `false` means this copy is marked for deletion.
     pub keep: bool,
+    /// Reference-directory files participate in matching but can never be deleted.
+    pub protected: bool,
 }
 
 impl FileEntry {
@@ -22,7 +24,20 @@ impl FileEntry {
             size,
             modified,
             keep: false,
+            protected: false,
         }
+    }
+
+    pub fn new_protected(
+        path: PathBuf,
+        size: u64,
+        modified: Option<SystemTime>,
+        protected: bool,
+    ) -> Self {
+        let mut entry = Self::new(path, size, modified);
+        entry.protected = protected;
+        entry.keep = protected;
+        entry
     }
 
     /// Lossy file name; paths are not guaranteed to be UTF-8 on either platform.
@@ -80,7 +95,12 @@ impl DupeGroup {
 
     /// Bytes that would be freed by keeping exactly one copy.
     pub fn wasted(&self) -> u64 {
-        self.size * (self.files.len() as u64).saturating_sub(1)
+        let removable = if self.files.iter().any(|file| file.protected) {
+            self.files.iter().filter(|file| !file.protected).count() as u64
+        } else {
+            (self.files.len() as u64).saturating_sub(1)
+        };
+        self.size * removable
     }
 
     /// Number of copies currently marked for deletion.
@@ -88,7 +108,10 @@ impl DupeGroup {
         if self.skipped {
             return 0;
         }
-        self.files.iter().filter(|f| !f.keep).count()
+        self.files
+            .iter()
+            .filter(|f| !f.keep && !f.protected)
+            .count()
     }
 
     /// Bytes that would be freed by the current marks.
@@ -100,13 +123,13 @@ impl DupeGroup {
         self.files.iter().filter(|f| f.keep).count()
     }
 
-    /// Make `idx` the sole keeper.
+    /// Keep `idx` in addition to every protected reference copy.
     pub fn keep_only(&mut self, idx: usize) {
         if idx >= self.files.len() {
             return;
         }
         for (i, f) in self.files.iter_mut().enumerate() {
-            f.keep = i == idx;
+            f.keep = f.protected || i == idx;
         }
     }
 
@@ -119,6 +142,9 @@ impl DupeGroup {
         let Some(file) = self.files.get(idx) else {
             return false;
         };
+        if file.protected {
+            return false;
+        }
         if file.keep && self.keeper_count() <= 1 {
             return false;
         }
@@ -129,6 +155,15 @@ impl DupeGroup {
     /// Choose the keeper for this group according to `strategy`.
     pub fn apply_strategy(&mut self, strategy: KeepStrategy) {
         if self.files.is_empty() {
+            return;
+        }
+        // A protected copy already satisfies the safety invariant. Bulk
+        // strategies may therefore mark every ordinary copy, but can never
+        // change the protected entries themselves.
+        if self.files.iter().any(|file| file.protected) {
+            for file in &mut self.files {
+                file.keep = file.protected;
+            }
             return;
         }
         let idx = match strategy {
@@ -224,6 +259,7 @@ impl SortKey {
 /// seek for every one of the survivors. A seek costs about as much as reading a
 /// megabyte outright, so below roughly that size the pass cannot win.
 pub const DEFAULT_HEAD_HASH_MIN: u64 = 1024 * 1024;
+pub const DEFAULT_CACHE_MIN_SIZE: u64 = 256 * 1024;
 
 /// Filters applied while walking the tree.
 #[derive(Debug, Clone)]
@@ -247,6 +283,11 @@ pub struct ScanOptions {
     /// means files of megabytes, not kilobytes. Set it above the largest file in
     /// the tree to skip the pass entirely.
     pub head_hash_min: u64,
+    /// Reuse BLAKE3 hashes when path, size and modification time still match.
+    pub use_cache: bool,
+    pub cache_min_size: u64,
+    /// Protected roots, which may be nested under the main root or external.
+    pub reference_roots: Vec<PathBuf>,
     /// Extensions to leave out entirely, lower-case and without the dot.
     ///
     /// Duplicate shared libraries are usually deliberate -- two applications
@@ -285,6 +326,9 @@ impl Default for ScanOptions {
             follow_links: false,
             min_size: 0,
             head_hash_min: DEFAULT_HEAD_HASH_MIN,
+            use_cache: false,
+            cache_min_size: DEFAULT_CACHE_MIN_SIZE,
+            reference_roots: Vec::new(),
             exclude_exts: Vec::new(),
         }
     }
@@ -356,6 +400,7 @@ pub struct ScanState {
     pub candidates: AtomicU64,
     pub files_hashed: AtomicU64,
     pub bytes_hashed: AtomicU64,
+    pub cache_hits: AtomicU64,
     pub errors: AtomicU64,
     pub current: Mutex<String>,
     pub cancel: AtomicBool,
@@ -466,6 +511,28 @@ mod tests {
         // Keeping a second copy reduces what deletion would free.
         assert!(g.toggle_mark(1));
         assert_eq!(g.reclaimable(), 100);
+    }
+
+    #[test]
+    fn a_reference_copy_is_always_kept_and_not_counted_as_removable() {
+        let mut g = DupeGroup::new(
+            [1; 32],
+            100,
+            vec![
+                FileEntry::new_protected(PathBuf::from("/reference.bin"), 100, at(1), true),
+                FileEntry::new(PathBuf::from("/ordinary.bin"), 100, at(2)),
+            ],
+        );
+
+        assert!(g.files[0].keep);
+        assert!(!g.files[1].keep);
+        assert_eq!(g.wasted(), 100);
+        assert_eq!(g.reclaimable(), 100);
+        assert!(!g.toggle_mark(0), "a reference mark cannot be changed");
+        g.keep_only(1);
+        assert!(g.files[0].keep && g.files[1].keep);
+        g.apply_strategy(KeepStrategy::Newest);
+        assert!(g.files[0].keep && !g.files[1].keep);
     }
 
     #[test]

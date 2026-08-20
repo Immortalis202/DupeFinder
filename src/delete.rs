@@ -106,7 +106,7 @@ pub fn pending_in<'a>(groups: impl IntoIterator<Item = &'a DupeGroup>) -> Vec<(P
         .flat_map(|g| {
             g.files
                 .iter()
-                .filter(|f| !f.keep)
+                .filter(|f| !f.keep && !f.protected)
                 .map(|f| (f.path.clone(), f.size))
         })
         .collect()
@@ -210,6 +210,17 @@ mod tests {
             !targets.iter().any(|(p, _)| p.ends_with("keep.bin")),
             "the keeper must never be a deletion target"
         );
+    }
+
+    #[test]
+    fn a_protected_copy_is_never_a_pending_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut group = on_disk_group(dir.path());
+        group.files[1].protected = true;
+        group.files[1].keep = false;
+
+        let targets = pending_in([&group]);
+        assert!(!targets.iter().any(|(path, _)| path.ends_with("drop1.bin")));
     }
 
     #[test]

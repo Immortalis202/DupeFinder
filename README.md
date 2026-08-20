@@ -57,10 +57,22 @@ dupefind ~/Pictures       # scan straight away
 | `--follow-links` | Follow symbolic links |
 | `--min-size BYTES` | Skip files below this size |
 | `--head-hash-min BYTES` | Only head hash files above this size (default 1 MiB) |
+| `--cache` | Reuse hashes when path, size, and modification time still match |
+| `--cache-min-size BYTES` | Only cache files at least this large (default 256 KiB) |
+| `--clear-cache` | Remove the persistent hash cache and exit |
+| `--reference DIRECTORY` | Match against a protected reference tree; repeatable |
+| `--export-dir DIRECTORY` | Write on-demand exports here instead of the current directory |
 | `--exclude-ext EXT` | Leave out files with this extension |
 
-Every boolean filter is also toggleable in the browser with keys `1`–`4`; the
+Every boolean filter is also toggleable in the browser with keys `1`–`5`; the
 header shows their current state.
+
+Reference directories may be nested inside the scan root or live elsewhere.
+Their files participate in duplicate matching but are permanently protected:
+they cannot be marked, directly deleted, or included in a deletion plan. A
+reference that contains (or equals) the scan root is rejected because it would
+make the whole scan read-only. In the browser, highlight a directory and press
+`R` to add or remove it as a reference.
 
 `--exclude-ext` repeats and accepts commas, so `--exclude-ext dll --exclude-ext exe`
 and `--exclude-ext dll,exe` are the same. Matching is case-insensitive and a
@@ -79,8 +91,9 @@ selection instead if you would rather see them and decide case by case.
 ## Keys
 
 **Browser** — `↑↓` navigate · `Enter` open · `Bksp` up · `~` home · `d` drives
-(Windows) / filesystem root · `.` show hidden directories · `1`–`4` filters ·
-`s` scan the highlighted directory · `q` quit
+(Windows) / filesystem root · `.` show hidden directories · `1`–`5` filters ·
+`R` toggle the highlighted reference directory · `s` scan the highlighted
+directory · `q` quit
 
 The first row of every listing is `[ scan all of <path> ]`, and it starts
 highlighted — so pressing `s` on entry scans the directory you are in. It is
@@ -115,7 +128,14 @@ nothing on a file and `s` falls back to scanning the containing directory. The
 **Dashboard** — `Tab` switch pane · `↑↓` move · `Space` keep the highlighted copy ·
 `d` toggle one mark · `x` skip the whole group · `s` cycle sort ·
 `t` Trash / permanent · `Del` delete just the highlighted file ·
-`D` delete the marked copies · `r` rescan · `q` quit
+`D` delete the marked copies · `e` export JSON and text reports · `r` rescan ·
+`q` quit
+
+Exports are created only when `e` is pressed. Each press writes a timestamped
+`.json` file for machine processing and a `.txt` file for review, without
+overwriting an earlier export. They include scan options, exact content hashes,
+timestamps, reference status, current keep/delete marks, selection state, and
+lossless raw path data in addition to display paths.
 
 `Del` is the direct route when one copy is obviously the junk one: it deletes
 exactly the highlighted file, whatever its mark, without needing you to unmark
@@ -161,6 +181,8 @@ Bulk keeper choices, applied to every group **in scope**:
   number you read is the number that will be acted on.
 - **Hardlinks are collapsed by default.** Two names for one file free no space
   when one is deleted, so they are reported as a single entry.
+- **Reference files are protected in every layer.** The data model, dashboard,
+  deletion planner, and direct-delete path all refuse to target them.
 - **A file that fails to delete stays listed** and is reported individually; one
   failure never aborts the rest of the run.
 
@@ -182,6 +204,15 @@ of 14,811 files totalling 500 MiB scans in well under a second.
 Files are hashed in parallel across files rather than within a single file, so
 the thread pool is not oversubscribed. Reads are issued in path order, so each
 worker walks a run of neighbouring files instead of jumping around the tree.
+Each worker reuses one 128 KiB read buffer across files, avoiding an allocation
+for every hash operation.
+
+The optional persistent cache stores the 16 KiB prefix and full BLAKE3 hashes.
+A record is reused only when its path, size, and modification timestamp match;
+otherwise the file is read normally. Records older than 90 days are pruned and
+the cache is capped at one million entries. Cache hits are shown during a scan.
+The cache is off by default so a first scan and explicitly uncached scans retain
+the same behavior as before.
 
 ### Tuning for a spinning disk
 
@@ -296,12 +327,12 @@ a real folder cannot wipe it.
 cargo test
 ```
 
-161 tests covering the scanner against fixture trees with known answers
+187 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.
 
 ## What is not included
 
-Group search/filter, report export, replacing duplicates with hardlinks,
-similar-image matching, and persisted configuration.
+Group search/filter, replacing duplicates with hardlinks, similar-image
+matching, and persisted configuration.

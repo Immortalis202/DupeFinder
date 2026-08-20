@@ -82,7 +82,8 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
                 ("Bksp", "up"),
                 ("~", "home"),
                 (".", "hidden dirs"),
-                ("1-4", "filters"),
+                ("1-5", "filters"),
+                ("R", "reference"),
                 #[cfg(windows)]
                 ("d", "drives"),
                 #[cfg(not(windows))]
@@ -116,12 +117,14 @@ fn footer_keys(app: &App) -> Vec<(String, String)> {
             });
             keys.push(("Del", "delete this file"));
             keys.push(("D", "delete marked"));
+            keys.push(("e", "export"));
             keys.push(("r", "rescan"));
             keys.push(("q", "quit"));
             owned(keys)
         }
         Screen::Done => owned(vec![
             ("Enter", "back to results"),
+            ("e", "export"),
             ("r", "rescan"),
             ("\u{2191}\u{2193}", "failures"),
             ("q", "quit"),
@@ -612,14 +615,14 @@ mod tests {
         }
     }
 
-    /// The footer advertises keys 1-4 for the scan filters, so their current
+    /// The footer advertises keys 1-5 for the scan filters, so their current
     /// state has to be on screen.
     #[test]
     fn the_picker_shows_the_filter_states_it_lets_you_toggle() {
         let mut app = app_with_results();
         app.screen = Screen::Picker;
         let text = rendered_text(&mut app, 100, 20);
-        for needle in ["hidden", "gitignore", "empty", "hardlinks"] {
+        for needle in ["hidden", "gitignore", "empty", "hardlinks", "cache"] {
             assert!(
                 text.contains(needle),
                 "the {needle:?} filter state is not visible:\n{text}"

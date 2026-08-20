@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::delete::DeleteMode;
-use crate::model::{DEFAULT_HEAD_HASH_MIN, ScanOptions};
+use crate::model::{DEFAULT_CACHE_MIN_SIZE, DEFAULT_HEAD_HASH_MIN, ScanOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,6 +64,26 @@ pub struct Args {
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_HEAD_HASH_MIN)]
     pub head_hash_min: u64,
 
+    /// Reuse cached hashes when path, size and modification time match.
+    #[arg(long)]
+    pub cache: bool,
+
+    /// Only cache files at least this large.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_CACHE_MIN_SIZE)]
+    pub cache_min_size: u64,
+
+    /// Remove the persistent hash cache and exit.
+    #[arg(long)]
+    pub clear_cache: bool,
+
+    /// Protected directory that participates in matching but never deletion.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub reference: Vec<PathBuf>,
+
+    /// Existing directory that receives on-demand exports.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub export_dir: Option<PathBuf>,
+
     /// Leave out files with this extension. Repeatable, or comma-separated:
     /// `--exclude-ext dll --exclude-ext exe` and `--exclude-ext dll,exe` are the
     /// same. Case-insensitive, and a leading dot is accepted.
@@ -95,6 +115,9 @@ impl Args {
             follow_links: self.follow_links,
             min_size: self.min_size,
             head_hash_min: self.head_hash_min,
+            use_cache: self.cache,
+            cache_min_size: self.cache_min_size,
+            reference_roots: self.reference.clone(),
             exclude_exts: normalise_exts(&self.exclude_ext),
         }
     }
@@ -159,5 +182,24 @@ mod tests {
         let o = opts(&["--min-size", "1024", "--exclude-ext", "dll"]);
         assert_eq!(o.min_size, 1024);
         assert_eq!(o.exclude_exts, vec!["dll"]);
+    }
+
+    #[test]
+    fn cache_and_reference_flags_reach_scan_options() {
+        let o = opts(&[
+            "--cache",
+            "--cache-min-size",
+            "4096",
+            "--reference",
+            "archive",
+            "--reference",
+            "backup",
+        ]);
+        assert!(o.use_cache);
+        assert_eq!(o.cache_min_size, 4096);
+        assert_eq!(
+            o.reference_roots,
+            vec![PathBuf::from("archive"), PathBuf::from("backup")]
+        );
     }
 }
