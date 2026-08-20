@@ -41,7 +41,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     // The number that matters: what pressing D would actually free.
-    let marked = app.total_marked();
+    let (marked, reclaimable) = app.marked_summary();
     let plan = Line::from(vec![
         Span::styled("marked ", Style::default().fg(DIM)),
         Span::styled(
@@ -52,7 +52,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(" · reclaims ", Style::default().fg(DIM)),
         Span::styled(
-            format::bytes(app.total_reclaimable()),
+            format::bytes(reclaimable),
             Style::default()
                 .fg(if marked > 0 { KEEP } else { DIM })
                 .add_modifier(Modifier::BOLD),
@@ -94,15 +94,27 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_groups(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.pane == Pane::Groups;
     let inner_width = area.width.saturating_sub(4) as usize;
+    let viewport = area.height.saturating_sub(2) as usize;
+    let range = visible_window(
+        app.groups.len(),
+        app.group_selected,
+        app.group_scroll,
+        viewport,
+        2,
+    );
+    app.group_scroll = range.start;
 
     let items: Vec<ListItem> = app
         .groups
+        .get(range.clone())
+        .unwrap_or_default()
         .iter()
         .enumerate()
-        .map(|(idx, g)| {
+        .map(|(relative_idx, g)| {
+            let idx = range.start + relative_idx;
             // "118.0 MiB x4  backup.tar.gz", behind a two-column marker gutter.
             let size = format!("{:>10}", format::bytes(g.size));
             let count = format!(" ×{:<3}", g.files.len());
@@ -140,16 +152,48 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
         .block(pane_block(&title, focused))
         .highlight_style(selection_style(focused))
         .highlight_symbol("")
-        .scroll_padding(2);
+        .scroll_padding(0);
 
     let mut state = ListState::default().with_selected(if app.groups.is_empty() {
         None
     } else {
-        Some(app.group_selected)
+        Some(app.group_selected.saturating_sub(range.start))
     });
     frame.render_stateful_widget(list, area, &mut state);
 
     draw_scrollbar(frame, area, app.groups.len(), app.group_selected);
+}
+
+/// Return the small slice of a large list that can actually be rendered.
+/// `offset` is retained across frames so ordinary arrow movement scrolls only
+/// when the cursor reaches the viewport padding.
+fn visible_window(
+    len: usize,
+    selected: usize,
+    offset: usize,
+    viewport: usize,
+    requested_padding: usize,
+) -> std::ops::Range<usize> {
+    if len == 0 || viewport == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(len - 1);
+    let max_start = len.saturating_sub(viewport);
+    let mut start = offset.min(max_start);
+    let padding = requested_padding.min(viewport.saturating_sub(1) / 2);
+
+    if selected < start.saturating_add(padding) {
+        start = selected.saturating_sub(padding);
+    } else {
+        let last_comfortable = start.saturating_add(viewport).saturating_sub(padding + 1);
+        if selected > last_comfortable {
+            start = selected
+                .saturating_add(padding + 1)
+                .saturating_sub(viewport);
+        }
+    }
+    start = start.min(max_start);
+    start..start.saturating_add(viewport).min(len)
 }
 
 fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
@@ -310,5 +354,31 @@ fn selection_style(focused: bool) -> Style {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+    }
+}
+
+#[cfg(test)]
+mod virtualization_tests {
+    use super::visible_window;
+
+    #[test]
+    fn a_large_list_only_exposes_one_viewport() {
+        let range = visible_window(106_235, 50_000, 0, 40, 2);
+        assert_eq!(range.len(), 40);
+        assert!(range.contains(&50_000));
+    }
+
+    #[test]
+    fn retained_offset_moves_only_at_the_padding() {
+        assert_eq!(visible_window(100, 11, 10, 10, 2), 9..19);
+        assert_eq!(visible_window(100, 16, 10, 10, 2), 10..20);
+        assert_eq!(visible_window(100, 18, 10, 10, 2), 11..21);
+    }
+
+    #[test]
+    fn tiny_and_empty_viewports_are_safe() {
+        assert_eq!(visible_window(100, 99, 0, 0, 2), 0..0);
+        assert_eq!(visible_window(100, 99, 0, 1, 2), 99..100);
+        assert_eq!(visible_window(0, 0, 0, 20, 2), 0..0);
     }
 }

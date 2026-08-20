@@ -327,7 +327,7 @@ a real folder cannot wipe it.
 cargo test
 ```
 
-187 tests covering the scanner against fixture trees with known answers
+190 tests covering the scanner against fixture trees with known answers
 (including files that share a 16 KiB head but differ in their last byte, which
 must *not* be grouped), the keep/delete invariants, real on-disk deletion, and
 rendering of every screen at terminal sizes from 1×1 to 300×8.

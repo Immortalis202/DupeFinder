@@ -32,8 +32,7 @@ pub fn draw_confirm(frame: &mut Frame, app: &App) {
     // Clear first: the dashboard underneath must not bleed through.
     frame.render_widget(Clear, area);
 
-    let count = app.total_marked();
-    let bytes = app.total_reclaimable();
+    let (count, bytes) = app.marked_summary();
 
     let (verdict, verdict_style) = if permanent {
         (

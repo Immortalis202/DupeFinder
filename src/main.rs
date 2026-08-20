@@ -23,7 +23,8 @@ use crate::cli::Args;
 /// live counters look continuous.
 const POLL_BUSY: Duration = Duration::from_millis(50);
 
-/// Poll interval when idle. Long enough that a parked TUI uses no measurable CPU.
+/// Poll interval when idle. The event loop still wakes periodically, but does
+/// not redraw unless input or application state changed.
 const POLL_IDLE: Duration = Duration::from_millis(250);
 
 fn main() -> Result<()> {
@@ -93,15 +94,15 @@ fn main() -> Result<()> {
 
     // `run` restores the terminal even if the closure returns an error or panics.
     ratatui::run(|terminal| -> Result<()> {
+        let mut redraw = true;
         while !app.should_quit {
-            terminal.draw(|frame| ui::draw(frame, &mut app))?;
-
             // Drain worker messages without blocking the draw loop.
             let scan_msgs: Vec<_> = app
                 .scan_rx
                 .as_ref()
                 .map(|rx| rx.try_iter().collect())
                 .unwrap_or_default();
+            redraw |= !scan_msgs.is_empty();
             for msg in scan_msgs {
                 app.handle_scan_msg(msg);
             }
@@ -111,8 +112,14 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|rx| rx.try_iter().collect())
                 .unwrap_or_default();
+            redraw |= !delete_msgs.is_empty();
             for msg in delete_msgs {
                 app.handle_delete_msg(msg);
+            }
+
+            if redraw {
+                terminal.draw(|frame| ui::draw(frame, &mut app))?;
+                redraw = false;
             }
 
             let timeout = if app.is_busy() { POLL_BUSY } else { POLL_IDLE };
@@ -123,6 +130,13 @@ fn main() -> Result<()> {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                     _ => {}
                 }
+                // Resize events need a frame too; harmless mouse/focus events
+                // are rare and keeping this unconditional keeps the loop clear.
+                redraw = true;
+            } else if app.is_busy() {
+                // Live counters are atomics, so they can change without a
+                // channel message while a worker is running.
+                redraw = true;
             }
         }
         Ok(())

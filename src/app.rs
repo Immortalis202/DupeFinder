@@ -110,6 +110,9 @@ pub struct App {
     // Results
     pub groups: Vec<DupeGroup>,
     pub group_selected: usize,
+    /// First group row currently visible. Keeping this across frames lets the
+    /// renderer format only the viewport instead of every result.
+    pub group_scroll: usize,
     pub file_selected: usize,
     pub pane: Pane,
     pub sort: SortKey,
@@ -152,6 +155,7 @@ impl App {
             errors: Vec::new(),
             groups: Vec::new(),
             group_selected: 0,
+            group_scroll: 0,
             file_selected: 0,
             pane: Pane::Groups,
             sort: SortKey::Wasted,
@@ -443,14 +447,36 @@ impl App {
         self.groups.get(self.group_selected)
     }
 
+    /// Count and size of marked files within the current selection scope.
+    ///
+    /// This deliberately does not construct deletion targets. The dashboard
+    /// calls it every frame, and cloning hundreds of thousands of paths there
+    /// made cursor movement scale with the entire result set.
+    pub fn marked_summary(&self) -> (usize, u64) {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| self.in_scope(*idx))
+            .flat_map(|(_, group)| {
+                group
+                    .files
+                    .iter()
+                    .filter(|file| !group.skipped && !file.keep && !file.protected)
+            })
+            .fold((0usize, 0u64), |(count, bytes), file| {
+                (count + 1, bytes.saturating_add(file.size))
+            })
+    }
+
     /// Bytes the current marks would free **within scope**.
+    #[cfg(test)]
     pub fn total_reclaimable(&self) -> u64 {
-        self.marked_targets().iter().map(|(_, size)| size).sum()
+        self.marked_summary().1
     }
 
     /// Files the current marks would remove **within scope**.
     pub fn total_marked(&self) -> usize {
-        self.marked_targets().len()
+        self.marked_summary().0
     }
 
     /// Every marked copy the selection scope covers.
