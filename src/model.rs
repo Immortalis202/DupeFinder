@@ -217,6 +217,14 @@ impl SortKey {
     }
 }
 
+/// Default for `ScanOptions::head_hash_min`.
+///
+/// Measured on a spinning disk: with the old 64 KiB threshold, a real scan head
+/// hashed 775,780 candidates to eliminate 19,077 of them -- 2.5% -- and paid a
+/// seek for every one of the survivors. A seek costs about as much as reading a
+/// megabyte outright, so below roughly that size the pass cannot win.
+pub const DEFAULT_HEAD_HASH_MIN: u64 = 1024 * 1024;
+
 /// Filters applied while walking the tree.
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -231,6 +239,14 @@ pub struct ScanOptions {
     pub same_file_system: bool,
     pub follow_links: bool,
     pub min_size: u64,
+    /// Only files larger than this get a head hash before the full one.
+    ///
+    /// The head pass costs one extra open, and therefore one extra seek, for
+    /// every candidate it does not eliminate. It only pays when reading the
+    /// whole file would cost much more than that seek, which on a spinning disk
+    /// means files of megabytes, not kilobytes. Set it above the largest file in
+    /// the tree to skip the pass entirely.
+    pub head_hash_min: u64,
     /// Extensions to leave out entirely, lower-case and without the dot.
     ///
     /// Duplicate shared libraries are usually deliberate -- two applications
@@ -268,6 +284,7 @@ impl Default for ScanOptions {
             same_file_system: false,
             follow_links: false,
             min_size: 0,
+            head_hash_min: DEFAULT_HEAD_HASH_MIN,
             exclude_exts: Vec::new(),
         }
     }
@@ -350,6 +367,12 @@ pub struct ScanState {
     /// dominate a large tree, which made the reported rate a small fraction of
     /// what the disk was actually delivering.
     pub hash_started_ms: AtomicU64,
+    /// Progress of the finalize phase, which opens every file in every surviving
+    /// group. On a large scan over a slow disk that is minutes of I/O, so it
+    /// needs a counter of its own rather than leaving the hashing gauge full and
+    /// motionless.
+    pub files_checked: AtomicU64,
+    pub files_to_check: AtomicU64,
 }
 
 impl ScanState {
@@ -632,6 +655,7 @@ mod tests {
         assert!(o.collapse_hardlinks);
         assert!(!o.follow_links);
         assert_eq!(o.min_size, 0);
+        assert_eq!(o.head_hash_min, DEFAULT_HEAD_HASH_MIN);
     }
 
     #[test]

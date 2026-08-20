@@ -56,6 +56,7 @@ dupefind ~/Pictures       # scan straight away
 | `--one-file-system` | Do not cross filesystem boundaries |
 | `--follow-links` | Follow symbolic links |
 | `--min-size BYTES` | Skip files below this size |
+| `--head-hash-min BYTES` | Only head hash files above this size (default 1 MiB) |
 | `--exclude-ext EXT` | Leave out files with this extension |
 
 Every boolean filter is also toggleable in the browser with keys `1`–`4`; the
@@ -169,9 +170,9 @@ Bulk keeper choices, applied to every group **in scope**:
 |---|---|
 | 1. Walk | Collect paths, bucketed by file size |
 | 2. Prune | Drop every size bucket holding one file — **no file is opened** |
-| 3. Head hash | BLAKE3 the first 16 KiB of larger candidates, re-bucket, prune again |
+| 3. Head hash | BLAKE3 the first 16 KiB of candidates above `--head-hash-min`, re-bucket, prune again |
 | 4. Full hash | BLAKE3 whole files in parallel, re-bucket, prune again |
-| 5. Finalize | Collapse hardlinks, sort by wasted space |
+| 5. Finalize | Identify every grouped file in parallel, collapse hardlinks, sort by wasted space |
 
 Phase 2 does the heavy lifting: on a typical tree it eliminates the large
 majority of files without any I/O, because a file whose size is unique cannot
@@ -179,7 +180,29 @@ have a duplicate. Only what survives gets read. Measured on this machine, a tree
 of 14,811 files totalling 500 MiB scans in well under a second.
 
 Files are hashed in parallel across files rather than within a single file, so
-the thread pool is not oversubscribed.
+the thread pool is not oversubscribed. Reads are issued in path order, so each
+worker walks a run of neighbouring files instead of jumping around the tree.
+
+### Tuning for a spinning disk
+
+An HDD is limited by seeks, not bandwidth, and every file costs one whether it is
+5 KiB or 5 MiB. Two flags matter there:
+
+- `--head-hash-min` decides which files get a cheap 16 KiB probe before being
+  read in full. That probe costs an extra open, and therefore an extra seek, for
+  every candidate it fails to eliminate. On an SSD it is nearly free and almost
+  always worth it; on an HDD it only pays when reading the whole file would cost
+  far more than a seek. Measured on one real HDD scan, the old 64 KiB threshold
+  head hashed 775,780 candidates to eliminate 19,077 of them — 2.5%, nowhere near
+  enough to pay for the seeks. Hence the 1 MiB default; raise it further for a
+  slow disk, lower it for a fast one.
+- `--min-size` skips small files outright. They are where nearly all the seeks
+  are and where nearly none of the reclaimable space is.
+
+The read rate on the scanning screen is bytes read over time spent reading, so
+during phase 3 it is capped by 16 KiB per file however fast the disk is. Phase 5
+opens every file in a surviving group, which on a large scan over a slow disk is
+minutes of work; it reports its own progress and can be cancelled.
 
 ## Platform notes
 

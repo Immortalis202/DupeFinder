@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use super::{ACCENT, DELETE, DIM, KEEP, WARN, header_block, stat, stat_line};
 use crate::app::App;
 use crate::format;
-use crate::model::ScanState;
+use crate::model::{Phase, ScanState};
 
 pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
     let state = &app.scan_state;
@@ -46,18 +46,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, header: Rect, body: Rect) {
 
     // Progress is only meaningful once the candidate set is known; during the
     // walk we cannot know the denominator, so the gauge shows activity instead.
-    let (hashed, candidates) = app.hash_progress();
-    let ratio = if candidates > 0 {
-        (hashed as f64 / candidates as f64).clamp(0.0, 1.0)
+    //
+    // Finalizing gets its own numbers: by then every candidate has been hashed,
+    // so the hashing gauge would sit at 100% while that phase opens every file
+    // in every group -- minutes of work on a slow disk, looking like a hang.
+    let (done, total, noun) = match app.phase {
+        Phase::Finalizing => {
+            let (checked, to_check) = app.finalize_progress();
+            (checked, to_check, "files identified")
+        }
+        _ => {
+            let (hashed, candidates) = app.hash_progress();
+            (hashed, candidates, "candidates hashed")
+        }
+    };
+    let ratio = if total > 0 {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let label = if candidates > 0 {
-        format!(
-            "{} / {} candidates hashed",
-            format::count(hashed),
-            format::count(candidates)
-        )
+    let label = if total > 0 {
+        format!("{} / {} {noun}", format::count(done), format::count(total))
     } else {
         "discovering files…".to_string()
     };

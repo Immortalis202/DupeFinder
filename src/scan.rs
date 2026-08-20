@@ -7,18 +7,18 @@
 //! 2. drop every size bucket holding a single file (no I/O at all)
 //! 3. hash the first 16 KiB of larger candidates and re-bucket
 //! 4. hash full contents in parallel and re-bucket
-//! 5. collapse hardlinks and sort
+//! 5. collapse hardlinks and sort (one open per grouped file, in parallel)
 //!
 //! Phase 2 is what makes this fast: on a typical tree it eliminates the large
 //! majority of files without opening any of them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crossbeam_channel::Sender;
 use ignore::WalkBuilder;
@@ -26,10 +26,6 @@ use rayon::prelude::*;
 use same_file::Handle;
 
 use crate::model::{DupeGroup, FileEntry, Phase, ScanError, ScanMsg, ScanOptions, ScanState};
-
-/// Size below which the head-hash phase is pointless: reading 16 KiB of a 20 KiB
-/// file costs the same as reading all of it, so we go straight to the full hash.
-const HEAD_HASH_MIN_SIZE: u64 = 64 * 1024;
 
 /// How much of the front of a file the head-hash phase reads.
 const HEAD_HASH_BYTES: u64 = 16 * 1024;
@@ -70,7 +66,7 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     }
 
     let _ = tx.send(ScanMsg::Phase(Phase::HeadHashing));
-    let candidates = match head_hash_pass(candidates, &state, &tx, started) {
+    let candidates = match head_hash_pass(candidates, &options, &state, &tx, started) {
         Some(c) => c,
         None => {
             let _ = tx.send(ScanMsg::Cancelled);
@@ -92,7 +88,13 @@ pub fn run(root: PathBuf, options: ScanOptions, state: Arc<ScanState>, tx: Sende
     };
 
     let _ = tx.send(ScanMsg::Phase(Phase::Finalizing));
-    let mut groups = finalize(groups, &options);
+    let mut groups = match finalize(groups, &options, &state) {
+        Some(g) => g,
+        None => {
+            let _ = tx.send(ScanMsg::Cancelled);
+            return;
+        }
+    };
     groups.sort_by(|a, b| {
         b.wasted()
             .cmp(&a.wasted())
@@ -223,14 +225,18 @@ fn prune_by_size(by_size: HashMap<u64, Vec<Candidate>>) -> Vec<Candidate> {
 /// Phase 3: split same-size buckets by the hash of their first 16 KiB.
 fn head_hash_pass(
     candidates: Vec<Candidate>,
+    options: &ScanOptions,
     state: &Arc<ScanState>,
     tx: &Sender<ScanMsg>,
     started: Instant,
 ) -> Option<Vec<Candidate>> {
-    // Files too small to benefit skip straight to the full hash.
+    // Files too small to benefit skip straight to the full hash. The head pass
+    // buys a cheap split at the price of one extra open per surviving candidate,
+    // which is only worth it when reading the file in full would cost far more
+    // than that -- see `ScanOptions::head_hash_min`.
     let (large, small): (Vec<_>, Vec<_>) = candidates
         .into_iter()
-        .partition(|c| c.size > HEAD_HASH_MIN_SIZE);
+        .partition(|c| c.size > options.head_hash_min);
 
     if large.is_empty() {
         return Some(small);
@@ -387,62 +393,105 @@ fn hash_upto(path: &Path, limit: u64) -> std::io::Result<([u8; 32], u64)> {
 }
 
 /// Phase 5: turn surviving buckets into groups, collapsing hardlinks.
-fn finalize(buckets: HashMap<[u8; 32], Vec<Candidate>>, options: &ScanOptions) -> Vec<DupeGroup> {
-    let mut groups = Vec::new();
+///
+/// This phase opens every file in every surviving group, so on a large scan over
+/// a slow disk it is minutes of I/O, not a formality. It therefore behaves like
+/// the hashing passes: work spread across the rayon pool, progress published as
+/// it goes, and cancellation honoured. Returns `None` if the scan was cancelled.
+fn finalize(
+    buckets: HashMap<[u8; 32], Vec<Candidate>>,
+    options: &ScanOptions,
+    state: &Arc<ScanState>,
+) -> Option<Vec<DupeGroup>> {
+    // The gauge is already full of hashed candidates by now, so it needs its own
+    // denominator here or it sits at 100% while this phase grinds away, which
+    // reads as a hang rather than as work.
+    let total: u64 = buckets.values().map(|bucket| bucket.len() as u64).sum();
+    state.files_checked.store(0, Ordering::Relaxed);
+    state.files_to_check.store(total, Ordering::Relaxed);
 
-    for (hash, mut bucket) in buckets {
-        if options.collapse_hardlinks {
-            bucket = collapse_hardlinks(bucket);
-            // A group of hardlinks to one inode is not a duplicate at all.
-            if bucket.len() < 2 {
-                continue;
+    let groups: Vec<DupeGroup> = buckets
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .filter_map(|(hash, bucket)| {
+            if state.is_cancelled() {
+                return None;
             }
-        }
+            finalize_group(hash, bucket, options, state)
+        })
+        .collect();
 
-        // Stable, predictable ordering so "keep the first" means something.
-        bucket.sort_by(|a, b| a.path.cmp(&b.path));
-
-        let size = bucket.first().map(|c| c.size).unwrap_or(0);
-        let files = bucket
-            .into_iter()
-            .map(|c| {
-                let modified = std::fs::metadata(&c.path)
-                    .ok()
-                    .and_then(|m| m.modified().ok());
-                FileEntry::new(c.path, c.size, modified)
-            })
-            .collect();
-
-        groups.push(DupeGroup::new(hash, size, files));
+    if state.is_cancelled() {
+        return None;
     }
-
-    groups
+    Some(groups)
 }
 
-/// Drop entries that are additional names for a file already in the bucket.
-///
-/// `same_file::Handle` holds the file open, so handles are built and dropped
-/// inside this function only; buckets are small, keeping descriptor use bounded.
-fn collapse_hardlinks(bucket: Vec<Candidate>) -> Vec<Candidate> {
-    let mut seen: Vec<Handle> = Vec::with_capacity(bucket.len());
-    let mut out = Vec::with_capacity(bucket.len());
+/// Build one group: identify every file in the bucket, drop the extra names for
+/// files already in it, and order what remains. `None` when nothing is left to
+/// choose between.
+fn finalize_group(
+    hash: [u8; 32],
+    bucket: Vec<Candidate>,
+    options: &ScanOptions,
+    state: &Arc<ScanState>,
+) -> Option<DupeGroup> {
+    // Keyed on the handle rather than scanned linearly: a bucket is usually two
+    // or three files, but a tree of vendored dependencies can produce one with
+    // thousands, and a linear scan makes that quadratic.
+    let mut seen: HashSet<Handle> = HashSet::with_capacity(bucket.len());
+    let mut files: Vec<FileEntry> = Vec::with_capacity(bucket.len());
 
     for candidate in bucket {
-        match Handle::from_path(&candidate.path) {
-            Ok(handle) => {
-                if seen.contains(&handle) {
-                    continue;
-                }
-                seen.push(handle);
-                out.push(candidate);
-            }
-            // If we cannot open it to check, keep it and let deletion report
-            // the error rather than silently dropping a real duplicate.
-            Err(_) => out.push(candidate),
+        state.set_current(&candidate.path.to_string_lossy());
+        let (modified, handle) = identify(&candidate.path, options.collapse_hardlinks);
+        ScanState::bump(&state.files_checked, 1);
+
+        // A second name for a file already here would free nothing if deleted.
+        if let Some(handle) = handle
+            && !seen.insert(handle)
+        {
+            continue;
         }
+
+        files.push(FileEntry::new(candidate.path, candidate.size, modified));
     }
 
-    out
+    // A group of hardlinks to one inode is not a duplicate at all.
+    if files.len() < 2 {
+        return None;
+    }
+
+    // Stable, predictable ordering so "keep the first" means something.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let size = files.first().map(|f| f.size).unwrap_or(0);
+    Some(DupeGroup::new(hash, size, files))
+}
+
+/// Open `path` once and take from that handle everything the group needs: the
+/// modification time, and the identity that tells two names for one file apart.
+///
+/// One open, not two. Asking for `Handle::from_path` and `fs::metadata`
+/// separately opened every grouped file twice, which doubled this phase's I/O on
+/// exactly the drives where it is already the slow part.
+///
+/// The handle is returned still open rather than reduced to a device and inode
+/// number, because on Windows a file index is only guaranteed to be stable while
+/// a handle to the file is held.
+fn identify(path: &Path, collapse_hardlinks: bool) -> (Option<SystemTime>, Option<Handle>) {
+    // Unreadable here means unreadable at deletion time too, where the error can
+    // actually be reported to the user; keep the entry either way rather than
+    // silently dropping a real duplicate.
+    let Ok(file) = File::open(path) else {
+        return (None, None);
+    };
+    let modified = file.metadata().ok().and_then(|m| m.modified().ok());
+
+    if !collapse_hardlinks {
+        return (modified, None);
+    }
+    (modified, Handle::from_file(file).ok())
 }
 
 /// Number of files hashed so far, for the progress gauge.
@@ -450,6 +499,14 @@ pub fn hashed_of(state: &ScanState) -> (u64, u64) {
     (
         ScanState::get(&state.files_hashed),
         ScanState::get(&state.candidates),
+    )
+}
+
+/// Number of grouped files identified so far, for the gauge during finalizing.
+pub fn checked_of(state: &ScanState) -> (u64, u64) {
+    (
+        ScanState::get(&state.files_checked),
+        ScanState::get(&state.files_to_check),
     )
 }
 
@@ -500,6 +557,79 @@ mod tests {
         );
     }
 
+    /// The head pass is an optimisation, never a filter. It changes how much
+    /// I/O a scan does and must change nothing about the answer, whether it runs
+    /// over every candidate or none of them.
+    #[test]
+    fn the_head_hash_threshold_does_not_change_the_answer() {
+        let dir = fixture();
+        let expected: BTreeSet<BTreeSet<String>> = [
+            names(&["one.txt", "one_copy.txt", "three.txt"]),
+            names(&["big1.bin", "big2.bin"]),
+        ]
+        .into_iter()
+        .collect();
+
+        for head_hash_min in [0, 64 * 1024, u64::MAX] {
+            let groups = scan_sync(
+                dir.path(),
+                ScanOptions {
+                    head_hash_min,
+                    ..ScanOptions::default()
+                },
+            );
+            assert_eq!(
+                group_names(&groups),
+                expected,
+                "head_hash_min {head_hash_min} changed the result"
+            );
+        }
+    }
+
+    /// Finalizing opens every file in every surviving group, which on a large
+    /// scan over a slow disk is minutes of I/O. Without its own numbers the gauge
+    /// sits full and motionless throughout, which reads as a hang.
+    #[test]
+    fn finalizing_counts_every_grouped_file() {
+        let dir = fixture();
+        let state = Arc::new(ScanState::default());
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        run(
+            dir.path().to_path_buf(),
+            ScanOptions::default(),
+            Arc::clone(&state),
+            tx,
+        );
+
+        let (checked, to_check) = checked_of(&state);
+        // The three copies of one.txt plus the big1/big2 pair.
+        assert_eq!(to_check, 5, "every file in a surviving group is identified");
+        assert_eq!(checked, to_check, "and the phase runs to completion");
+    }
+
+    /// Esc used to do nothing during finalizing, since the phase never asked
+    /// whether it had been cancelled.
+    #[test]
+    fn finalizing_stops_when_cancelled() {
+        let dir = fixture();
+        let bucket = ["a/one.txt", "b/one_copy.txt"]
+            .iter()
+            .map(|name| Candidate {
+                path: dir.path().join(name),
+                size: 55,
+            })
+            .collect();
+        let mut buckets = HashMap::new();
+        buckets.insert([7u8; 32], bucket);
+
+        let state = Arc::new(ScanState::default());
+        state.request_cancel();
+        assert!(
+            finalize(buckets, &ScanOptions::default(), &state).is_none(),
+            "a cancelled scan must not spend the I/O to finalize"
+        );
+    }
+
     /// Each group rendered as its sorted set of file names, for order-independent
     /// comparison.
     fn group_names(groups: &[DupeGroup]) -> BTreeSet<BTreeSet<String>> {
@@ -547,7 +677,9 @@ mod tests {
         fs::create_dir_all(root.join("ignored")).unwrap();
         fs::write(root.join("ignored/dup.txt"), dup).unwrap();
 
-        // Large identical pair: exercises the head-hash phase and survives it.
+        // Larger identical pair. Bigger than the small files above, but under the
+        // default head-hash threshold, so the tests that mean to exercise that
+        // pass lower the threshold explicitly rather than relying on file size.
         let big = vec![0xABu8; 80 * 1024];
         fs::write(root.join("big1.bin"), &big).unwrap();
         fs::write(root.join("big2.bin"), &big).unwrap();
@@ -582,13 +714,24 @@ mod tests {
     #[test]
     fn files_sharing_a_head_but_not_a_tail_are_not_duplicates() {
         let dir = fixture();
-        let groups = scan_sync(dir.path(), ScanOptions::default());
-        for group in &groups {
-            for file in &group.files {
-                assert!(
-                    !file.file_name().starts_with("bighead"),
-                    "bighead files differ in their last byte and must not be grouped"
-                );
+        // Once with the head pass running over them, once with it skipped: a
+        // shared head must never be mistaken for shared content either way.
+        for head_hash_min in [0, u64::MAX] {
+            let groups = scan_sync(
+                dir.path(),
+                ScanOptions {
+                    head_hash_min,
+                    ..ScanOptions::default()
+                },
+            );
+            for group in &groups {
+                for file in &group.files {
+                    assert!(
+                        !file.file_name().starts_with("bighead"),
+                        "bighead files differ in their last byte and must not be \
+                         grouped (head_hash_min {head_hash_min})"
+                    );
+                }
             }
         }
     }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::delete::DeleteMode;
-use crate::model::ScanOptions;
+use crate::model::{DEFAULT_HEAD_HASH_MIN, ScanOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -54,6 +54,16 @@ pub struct Args {
     #[arg(long, value_name = "BYTES", default_value_t = 0)]
     pub min_size: u64,
 
+    /// Only head hash files larger than this many bytes.
+    ///
+    /// Before hashing a file in full, the scanner hashes its first 16 KiB to
+    /// split same-size candidates cheaply. That extra open costs a seek, which
+    /// on a spinning disk is about what reading a whole megabyte costs, so for
+    /// smaller files the pass is a net loss. Raise it for an HDD, lower it for
+    /// an SSD, or set it above your largest file to skip the pass entirely.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_HEAD_HASH_MIN)]
+    pub head_hash_min: u64,
+
     /// Leave out files with this extension. Repeatable, or comma-separated:
     /// `--exclude-ext dll --exclude-ext exe` and `--exclude-ext dll,exe` are the
     /// same. Case-insensitive, and a leading dot is accepted.
@@ -84,6 +94,7 @@ impl Args {
             same_file_system: self.one_file_system,
             follow_links: self.follow_links,
             min_size: self.min_size,
+            head_hash_min: self.head_hash_min,
             exclude_exts: normalise_exts(&self.exclude_ext),
         }
     }

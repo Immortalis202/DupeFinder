@@ -977,6 +977,12 @@ impl App {
         scan::hashed_of(&self.scan_state)
     }
 
+    /// Progress of the finalize phase, which has its own denominator: the files
+    /// in surviving groups, not the candidates that were hashed.
+    pub fn finalize_progress(&self) -> (u64, u64) {
+        scan::checked_of(&self.scan_state)
+    }
+
     pub fn scanned_bytes(&self) -> u64 {
         self.scan_state.bytes_seen.load(Ordering::Relaxed)
     }

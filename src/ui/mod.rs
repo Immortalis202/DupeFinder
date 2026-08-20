@@ -833,6 +833,32 @@ mod tests {
         );
     }
 
+    /// Finalizing opens every grouped file, so it needs its own progress. Left on
+    /// the hashing numbers the gauge sits at 100% for minutes and reads as a hang.
+    #[test]
+    fn the_gauge_follows_the_finalize_phase() {
+        let mut app = app_with_results();
+        app.screen = Screen::Scanning;
+        app.phase = Phase::FullHashing;
+        crate::model::ScanState::bump(&app.scan_state.files_hashed, 900);
+        crate::model::ScanState::bump(&app.scan_state.candidates, 900);
+        crate::model::ScanState::bump(&app.scan_state.files_checked, 4);
+        crate::model::ScanState::bump(&app.scan_state.files_to_check, 40);
+
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("900 / 900 candidates hashed"),
+            "hashing reports candidates:\n{text}"
+        );
+
+        app.phase = Phase::Finalizing;
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(
+            text.contains("4 / 40 files identified"),
+            "finalizing reports its own files, not a full hashing gauge:\n{text}"
+        );
+    }
+
     #[test]
     fn the_focused_pane_is_visually_distinct() {
         let mut app = app_with_results();
